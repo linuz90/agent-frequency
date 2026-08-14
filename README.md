@@ -57,13 +57,26 @@ cd agent-frequency
 ./bin/agent-frequency-install
 ```
 
-The installer pins dependencies and registers `bin/agent-frequency-mcp` globally with every client it finds, repairing registrations that point at an older checkout. Verify anytime with `./bin/agent-frequency-install --check`, then start a fresh client session so it loads the new server.
+That's the whole setup. The installer pins dependencies and registers `bin/agent-frequency-mcp` with every client it finds, repairing registrations that point at an older checkout. Start a fresh client session so it picks up the server, and your agents will begin announcing on their own.
 
-MCP tools are model-controlled, so a tool description alone cannot tell an agent *when* to call one. Agent Frequency ships that standing directive in the MCP `instructions` field, which the spec defines as guidance a client may add to the model's system prompt. Claude Code and Codex both surface it, so in those clients there is nothing further to configure.
+They do that without any prompting from you because the server ships its own standing directive in the MCP [`instructions`](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) field — the spec's channel for telling a model how to use a server, which a client surfaces once per session. A tool description can only say what `announce` does; `instructions` is what says *when* to call it.
 
-If your client ignores `instructions` — some do — add the equivalent to your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or the client's equivalent):
+Verify the registration anytime:
+
+```bash
+./bin/agent-frequency-install --check
+```
+
+<details>
+<summary>Fallback: clients that ignore <code>instructions</code></summary>
+
+Host behavior is implementation-defined, and some clients drop the field. If yours does, paste the equivalent into your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or the client's equivalent):
 
 > Before editing in a Git repository, call Agent Frequency's `announce` tool with `state: "working"`, a concise summary, the current working directory, narrow expected scopes, and a fixed timebox. Respect blocked scopes. Re-announce with the returned `lease_id` when scope changes and before commit or push. After finishing, announce `state: "done"` with that `lease_id` to release the claims immediately.
+
+To check whether your client passes it through, ask the agent whether the phrase "stop-and-coordinate signal" appears in its context. If it does, the instructions arrived.
+
+</details>
 
 ## The `announce` tool
 
@@ -100,6 +113,44 @@ One timing limitation is fundamental: of two simultaneous callers, the later one
 The **Agents** view groups active leases by repository with summaries, branches, claims, dirty paths, and lease countdowns. The **Activity** view shows recent announcements, check-ins, and completions. Both refresh every few seconds, and open tabs reload themselves when the UI changes.
 
 The monitor is strictly read-only: it opens SQLite in read-only mode, never mutates a lease, and binds to loopback only. Everything it renders is peer-authored text assigned through `textContent`. To reach it from another device, put it behind something like a Tailscale Serve proxy — and read the privacy section first, since the page exposes dirty filenames.
+
+### Keeping it running (macOS)
+
+The installer deliberately does not touch your login items, so the monitor is a foreground process you start when you want it. To keep it running across restarts, hand it to `launchd`:
+
+Run this from the repository root — it expands your checkout path and Bun location into the file:
+
+```bash
+cat > ~/Library/LaunchAgents/com.agent-frequency.monitor.plist <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agent-frequency.monitor</string>
+  <key>ProgramArguments</key>
+  <array><string>$(pwd)/bin/agent-frequency-monitor</string></array>
+  <key>WorkingDirectory</key><string>$(pwd)</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/agent-frequency-monitor.log</string>
+  <key>StandardErrorPath</key><string>/tmp/agent-frequency-monitor.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$(dirname "$(command -v bun)"):/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+
+launchctl load ~/Library/LaunchAgents/com.agent-frequency.monitor.plist
+```
+
+It starts at login, restarts if it exits, and logs to `/tmp/agent-frequency-monitor.log`. Stop it with `launchctl unload` on the same path.
+
+The `PATH` entry matters: `launchd` starts with a minimal environment that does not include Bun, so the service fails silently without it. Check `/tmp/agent-frequency-monitor.err` if the page does not come up.
+
+On Linux, the equivalent is a user systemd unit with `Restart=always` and `WantedBy=default.target`.
 
 ### Demo traffic
 
