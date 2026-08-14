@@ -8,6 +8,42 @@ Agent Frequency gives every agent one lightweight operation: announce what you i
 
 The metaphor is aviation radio. Agents self-announce position and intent while listening for nearby traffic, with no control tower in the middle. The product is **presence and collision awareness, not task management**.
 
+![The Agent Frequency monitor, showing seven agents working across four repositories](docs/monitor.png)
+
+<p align="center"><em>The optional read-only <a href="#monitor">monitor</a>, showing live traffic across four repositories.</em></p>
+
+## Quick install prompt
+
+Hand this to any coding agent and it will set everything up:
+
+```text
+Set up Agent Frequency (https://github.com/linuz90/agent-frequency) on this machine.
+
+1. Check that Bun 1.3.14+ is installed; if it is missing, stop and ask me first.
+   Clone the repo to a stable, permanent path such as ~/Code/agent-frequency —
+   it gets baked into the client config and the login service, so moving it
+   later breaks both. cd into it.
+2. Run ./bin/agent-frequency-install. It installs dependencies and registers the
+   MCP server with whichever of Codex and Claude Code are present. Confirm with
+   ./bin/agent-frequency-install --check.
+3. macOS only: keep the monitor running at login. First check that nothing is
+   already listening on port 7893. Then write a LaunchAgent at
+   ~/Library/LaunchAgents/com.agent-frequency.monitor.plist running
+   <checkout>/bin/agent-frequency-monitor, with RunAtLoad and KeepAlive enabled,
+   WorkingDirectory set to the checkout, StandardOutPath and StandardErrorPath
+   set so failures are visible, and EnvironmentVariables setting HOME plus a
+   PATH containing the real bun directory — resolve it with
+   readlink -f "$(command -v bun)", since launchd's default PATH omits Bun and
+   the service then fails silently. Check it with plutil -lint, then start it
+   with launchctl bootstrap gui/$(id -u) <plist path>. On Linux, use an
+   equivalent user systemd unit instead.
+4. Wait a few seconds, then confirm http://127.0.0.1:7893 serves the monitor and
+   that the process serving it is the one launchd started. Then tell me to start
+   a fresh agent session so it picks up the new MCP server.
+```
+
+Prefer to do it yourself? See [Install](#install) for the same steps by hand.
+
 ## How it works
 
 Agent Frequency is a local stdio MCP server exposing exactly one tool: `announce`. Every call atomically publishes the caller's intent and returns the traffic that matters to it.
@@ -106,9 +142,7 @@ One timing limitation is fundamental: of two simultaneous callers, the later one
 
 ## Monitor
 
-`./bin/agent-frequency-monitor` serves a live view of the frequency at `http://127.0.0.1:7893`.
-
-![The Agent Frequency monitor, showing seven agents working across four repositories](docs/monitor.png)
+`./bin/agent-frequency-monitor` serves a live view of the frequency at `http://127.0.0.1:7893` — the page [shown above](#agent-frequency).
 
 The **Agents** view groups active leases by repository with summaries, branches, claims, dirty paths, and lease countdowns. The **Activity** view shows recent announcements, check-ins, and completions. Both refresh every few seconds, and open tabs reload themselves when the UI changes.
 
@@ -143,10 +177,10 @@ cat > ~/Library/LaunchAgents/com.agent-frequency.monitor.plist <<PLIST
 </plist>
 PLIST
 
-launchctl load ~/Library/LaunchAgents/com.agent-frequency.monitor.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-frequency.monitor.plist
 ```
 
-It starts at login, restarts if it exits, and logs to `/tmp/agent-frequency-monitor.log`. Stop it with `launchctl unload` on the same path.
+It starts at login, restarts if it exits, and logs to `/tmp/agent-frequency-monitor.log`. Stop it with `launchctl bootout gui/$(id -u)/com.agent-frequency.monitor`. (`launchctl load`/`unload` still work, but `launchctl` itself now points to `bootstrap` instead.)
 
 The `PATH` entry matters: `launchd` starts with a minimal environment that does not include Bun, so the service fails silently without it. Check `/tmp/agent-frequency-monitor.err` if the page does not come up.
 
