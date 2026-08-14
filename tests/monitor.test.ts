@@ -5,13 +5,21 @@ import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
 
-import { startMonitor, type MonitorHandle, type MonitorState } from "../src/monitor";
+import {
+  resolvePeers,
+  startMonitor,
+  type MonitorHandle,
+  type MonitorOptions,
+  type MonitorState,
+} from "../src/monitor";
 
 const monitors: MonitorHandle[] = [];
 const temporaryDirectories: string[] = [];
+const fakePeerServers: Array<ReturnType<typeof Bun.serve>> = [];
 
 afterEach(async () => {
   for (const monitor of monitors.splice(0)) await monitor.stop();
+  for (const server of fakePeerServers.splice(0)) await server.stop(true);
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -23,11 +31,18 @@ function temporaryDatabasePath(): string {
   return join(directory, "state.sqlite3");
 }
 
-function startTestMonitor(dbPath: string): MonitorHandle {
+function startTestMonitor(dbPath: string, options: Partial<MonitorOptions> = {}): MonitorHandle {
   // Port 0 lets the kernel pick a free port so concurrent test files cannot collide.
-  const monitor = startMonitor({ port: 0, dbPath });
+  const monitor = startMonitor({ port: 0, dbPath, ...options });
   monitors.push(monitor);
   return monitor;
+}
+
+/** Serves a fixed payload as if it were a peer monitor's /api/state. */
+function startFakePeer(handler: (request: Request) => Response | Promise<Response>): string {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: handler });
+  fakePeerServers.push(server);
+  return server.url.href.replace(/\/$/, "");
 }
 
 async function fetchState(monitor: MonitorHandle): Promise<MonitorState> {
@@ -248,6 +263,38 @@ describe("monitor", () => {
     expect(state.events_truncated).toBe(0);
     expect(state.events).toEqual([]);
     expect(typeof state.now_ms).toBe("number");
+    expect(typeof state.hostname).toBe("string");
+    expect(state.hostname.length).toBeGreaterThan(0);
+    expect(state.peers).toEqual([]);
+  });
+
+  test("prefers an explicit machine label over the system hostname", async () => {
+    const previous = process.env.AGENT_FREQUENCY_MACHINE_LABEL;
+    process.env.AGENT_FREQUENCY_MACHINE_LABEL = " mbp ";
+    try {
+      const monitor = startTestMonitor(temporaryDatabasePath());
+      const state = await fetchState(monitor);
+      // Trimmed and stripped of control characters: the label renders in the
+      // monitor beside peer-reported names.
+      expect(state.hostname).toBe("mbp");
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_FREQUENCY_MACHINE_LABEL;
+      else process.env.AGENT_FREQUENCY_MACHINE_LABEL = previous;
+    }
+  });
+
+  test("falls back to the system hostname when the label override is blank", async () => {
+    const previous = process.env.AGENT_FREQUENCY_MACHINE_LABEL;
+    process.env.AGENT_FREQUENCY_MACHINE_LABEL = "   ";
+    try {
+      const monitor = startTestMonitor(temporaryDatabasePath());
+      const state = await fetchState(monitor);
+      expect(state.hostname.length).toBeGreaterThan(0);
+      expect(state.hostname).not.toBe("   ");
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_FREQUENCY_MACHINE_LABEL;
+      else process.env.AGENT_FREQUENCY_MACHINE_LABEL = previous;
+    }
   });
 
   test("returns active leases with parsed dirty paths and joined claims", async () => {
@@ -360,6 +407,67 @@ describe("monitor", () => {
     expect(state.events.map((event) => event.agent_state)).toEqual(["working", "working", "working"]);
   });
 
+  test("surfaces the additive task emoji on leases and activity", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const database = new Database(dbPath, { strict: true });
+    // seedDatabase writes the pre-emoji schema on purpose, so this mirrors the
+    // store's additive upgrade arriving under a running monitor.
+    database.exec("ALTER TABLE leases ADD COLUMN emoji TEXT");
+    database.exec("ALTER TABLE activity_events ADD COLUMN emoji TEXT");
+    database.exec("UPDATE leases SET emoji = '🐛' WHERE agent_id = 'alpha'");
+    database.exec("UPDATE activity_events SET emoji = '🐛' WHERE agent_id = 'alpha'");
+    database.close(false);
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    expect(state.leases[0]?.emoji).toBe("🐛");
+    expect(state.events.some((event) => event.emoji === "🐛")).toBeTrue();
+  });
+
+  test("reports no emoji when the column predates this schema", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    // An older MCP process never wrote the column; presence and the feed must
+    // still render, simply without an emoji.
+    expect(state.leases[0]?.emoji).toBeNull();
+    expect(state.event_count).toBe(3);
+    expect(state.events.every((event) => event.emoji === null)).toBeTrue();
+  });
+
+  test("reports the additive testing flag as a testing agent state", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const database = new Database(dbPath, { strict: true });
+    // Matches the store's additive upgrade: the v2 agent_state column stays as
+    // it is and "testing" arrives as a flag alongside it.
+    database.exec("ALTER TABLE leases ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
+    database.exec("ALTER TABLE activity_events ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE leases SET testing = 1 WHERE agent_id = 'alpha'");
+    database.exec("UPDATE activity_events SET testing = 1 WHERE agent_id = 'alpha'");
+    // Testing releases every exclusive claim, so a real testing lease holds
+    // shared paths only.
+    database.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
+    database.close(false);
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    expect(state.leases[0]?.agent_state).toBe("testing");
+    expect(state.events.map((event) => event.agent_state)).toEqual(["done", "testing", "working"]);
+
+    // An older process renewing that lease writes real claims without touching
+    // the flag, and the claims are what count.
+    const stale = new Database(dbPath, { strict: true });
+    stale.exec(
+      "UPDATE claims SET access = 'exclusive' WHERE lease_id = 'lease-active' AND path = 'src/auth/token.ts'",
+    );
+    stale.close(false);
+    expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
+  });
+
   test("bounds the activity payload and reports older retained events", async () => {
     const dbPath = temporaryDatabasePath();
     const nowMs = Date.now();
@@ -412,6 +520,12 @@ describe("monitor", () => {
     expect(html).toContain("<title>Agent Frequency</title>");
     expect(html).toContain(`var UI_VERSION = "${uiVersion}"`);
     expect(html).not.toContain("__AGENT_FREQUENCY_UI_VERSION__");
+    // The page is authored as monitor.html + monitor.css + monitor.js but must
+    // ship as one self-contained document: both splice placeholders resolved,
+    // stylesheet and client script inline.
+    expect(html).not.toContain("__AGENT_FREQUENCY_STYLE__");
+    expect(html).not.toContain("__AGENT_FREQUENCY_SCRIPT__");
+    expect(html).toContain(".speech-bubble {");
     expect(html).toContain('fetch(basePath + "api/state"');
     expect(html).not.toContain('fetch("/api/state"');
     expect(html).toContain("serverUiVersion !== UI_VERSION");
@@ -423,13 +537,50 @@ describe("monitor", () => {
     expect(html).toContain("focusedDetailsKey");
     expect(html).toContain("function surfaceLabel(surface)");
     expect(html).toContain("lease.client_surface");
-    expect(html).toContain("surfaceLabel(event.client_surface)");
-    expect(html).toContain("function completionIcon()");
+    // The host app and the machine render as one chip, and every feed builds it
+    // through the same helper so identity reads the same way everywhere.
+    expect(html).toContain("function originChip(clientSurface, machine)");
+    expect(html).toContain("originChip(event.client_surface, entry.machine)");
+    expect(html).toContain("originChip(newest.client_surface, newest.machine)");
+    expect(html).toContain('el("span", "origin-machine", machine)');
+    // Session id and lease countdown read as chips beside the origin chip, so
+    // the byline is one row of uniform, quiet facts.
+    expect(html).toContain("function sessionChip(agentId, agentLabel)");
+    expect(html).toContain('el("span", "chip session-chip mono", shortAgentId(agentId, agentLabel))');
+    expect(html).toContain('var expiry = el("span", "chip expiry-chip")');
+    expect(html).toContain("expiry.title = expiryTitle(lease)");
+    // A lease outlives a crashed agent, so a long check-in gap is marked rather
+    // than left for the reader to compute, and it is recomputed on the clock.
+    expect(html).toContain("function staleAfterMs(lease)");
+    expect(html).toContain('trackTime(updated, "age", lease.updated_at_ms, staleAfterMs(lease))');
+    expect(html).toContain('entry.node.classList.toggle("stale", stale)');
+    expect(html).toContain("timeNodes.forEach(applyTime)");
+    // Traffic from this machine carries its own label once peers make the
+    // machine a real distinction, so an absent label never means "local".
+    expect(html).toContain("function localMachineName(state)");
+    expect(html).toContain("entries.push({ lease: lease, machine: local, homeDir: state.home_dir })");
+    expect(html).toContain("function completionIcon(className)");
     expect(html).toContain('event.agent_state === "done" ? completionIcon()');
     expect(html).toContain('call.setAttribute("data-state", event.agent_state === "done" ? "done" : "working")');
     expect(html).toContain('if (event.agent_state === "done") return "claims released"');
     expect(html).toContain('? "completed work"');
-    expect(html).toContain('id="project-filter-select" aria-label="Filter agents by project"');
+    // A testing agent is live but holds nothing, so its card must say so
+    // instead of reading like an ordinary set of claims.
+    expect(html).toContain('var testing = lease.agent_state === "testing"');
+    expect(html).toContain('meta.appendChild(el("span", "agent-state", "testing"))');
+    expect(html).toContain('el("span", null, "not blocking")');
+    expect(html).toContain('testing ? "Scopes under test" : "Claimed scopes"');
+    expect(html).toContain('if (event.agent_state === "testing") return "verifying, claims released"');
+    expect(html).toContain('? "started testing"');
+    expect(html).toContain(
+      'id="project-filter-select" aria-label="Filter agents by project or machine"',
+    );
+    expect(html).toContain('new URLSearchParams(window.location.search).get("machine")');
+    expect(html).toContain("function matchesFilter(state, repo, machine)");
+    expect(html).toContain('machineGroup.label = "Machines"');
+    // Re-renders must not let the browser clamp the scroll position while the
+    // page is momentarily empty.
+    expect(html).toContain("window.scrollTo(scrollX, scrollY)");
     expect(html).toContain('new URLSearchParams(window.location.search).get("repo")');
     expect(html).toContain("function visibleLeases(state)");
     expect(html).toContain('url.searchParams.set("repo", selectedRepo)');
@@ -437,6 +588,23 @@ describe("monitor", () => {
     // Repository names are untrusted, so grouping must not use a plain Object
     // where names such as "__proto__" resolve inherited properties.
     expect(html).toContain("var groups = new Map();");
+    // Past work is rolled up from the activity feed in the page, so the monitor
+    // keeps serving exactly one bounded read-only payload.
+    expect(html).toContain("function recentTasks(state)");
+    // Finished tasks render inside their project's section instead of a
+    // separate feed, bounded per project and by a recency window.
+    expect(html).toContain("function renderRecentTasks(section, tasks)");
+    expect(html).toContain("function groupTasksByRepo(tasks)");
+    expect(html).toContain('el("p", "recent-label", "Recent")');
+    expect(html).toContain("list.length < MAX_PROJECT_RECENT_TASKS");
+    expect(html).toContain("task.ended_at_ms >= cutoff");
+    expect(html).not.toContain("renderRecentWork");
+    // One session's finished tasks share a head, so the summaries stay scannable.
+    expect(html).toContain("function groupTasksBySession(tasks)");
+    // A finished run closes on its "done" call; a session that is still live
+    // stays out of past work because its own card already shows it.
+    expect(html).toContain('if (event.agent_state === "done") {');
+    expect(html).toContain("if (!active.has(key)) tasks.push(task);");
 
     const stateResponse = await fetch(`${monitor.url}api/state`);
     expect(stateResponse.headers.get("x-agent-frequency-ui-version")).toBe(uiVersion);
@@ -459,6 +627,203 @@ describe("monitor", () => {
       leases: [],
       events: [],
     });
+  });
+
+  test("parses peer URLs from flags and environment", () => {
+    expect(resolvePeers([], {})).toEqual([]);
+    expect(resolvePeers([], { AGENT_FREQUENCY_MONITOR_PEERS: "" })).toEqual([]);
+    expect(
+      resolvePeers([], {
+        AGENT_FREQUENCY_MONITOR_PEERS:
+          " https://mba.tailnet.ts.net/agents/ , http://127.0.0.1:7894, https://mba.tailnet.ts.net/agents",
+      }),
+    ).toEqual(["https://mba.tailnet.ts.net/agents", "http://127.0.0.1:7894"]);
+    // Flags take precedence over the environment, mirroring resolvePort.
+    expect(
+      resolvePeers(["--peer", "http://127.0.0.1:1234", "--peer=http://127.0.0.1:5678/"], {
+        AGENT_FREQUENCY_MONITOR_PEERS: "http://127.0.0.1:9999",
+      }),
+    ).toEqual(["http://127.0.0.1:1234", "http://127.0.0.1:5678"]);
+    expect(() => resolvePeers(["--peer", "not a url"], {})).toThrow("Invalid monitor peer URL");
+    expect(() => resolvePeers(["--peer", "file:///etc/passwd"], {})).toThrow("http(s)");
+  });
+
+  test("aggregates a reachable peer monitor into the state payload", async () => {
+    const peerDbPath = temporaryDatabasePath();
+    seedDatabase(peerDbPath, Date.now());
+    const peerMonitor = startTestMonitor(peerDbPath);
+
+    const localMonitor = startTestMonitor(temporaryDatabasePath(), {
+      peers: [peerMonitor.url.replace(/\/$/, "")],
+    });
+    const state = await fetchState(localMonitor);
+
+    expect(state.leases).toEqual([]);
+    expect(state.peers).toHaveLength(1);
+    const peer = state.peers[0];
+    expect(peer?.reachable).toBeTrue();
+    expect(peer?.error).toBeNull();
+    expect(typeof peer?.hostname).toBe("string");
+    expect(peer?.snapshot?.database_available).toBeTrue();
+    expect(peer?.snapshot?.agent_count).toBe(1);
+    expect(peer?.snapshot?.leases[0]?.agent_id).toBe("alpha");
+    expect(peer?.snapshot?.leases[0]?.claims).toEqual([
+      { path: "src/auth/token.ts", access: "exclusive" },
+      { path: "tests/auth", access: "shared" },
+    ]);
+    expect(peer?.snapshot?.leases[0]?.expires_at_ms).toBeGreaterThan(Date.now());
+    expect(peer?.snapshot?.events).toHaveLength(3);
+    expect(typeof peer?.snapshot?.home_dir).toBe("string");
+    // Aggregation is one level deep: the peer's own peers array must not nest.
+    expect(peer?.snapshot && "peers" in peer.snapshot).toBeFalse();
+    // Lease renewal handles must not leak through federation either.
+    expect(JSON.stringify(state)).not.toContain("lease-active");
+  });
+
+  test("carries a testing agent on another machine through federation", async () => {
+    const peerDbPath = temporaryDatabasePath();
+    seedDatabase(peerDbPath, Date.now());
+    const peerDatabase = new Database(peerDbPath, { strict: true });
+    peerDatabase.exec("ALTER TABLE leases ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
+    peerDatabase.exec("UPDATE leases SET testing = 1 WHERE agent_id = 'alpha'");
+    peerDatabase.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
+    peerDatabase.close(false);
+    const peerMonitor = startTestMonitor(peerDbPath);
+
+    const localMonitor = startTestMonitor(temporaryDatabasePath(), {
+      peers: [peerMonitor.url.replace(/\/$/, "")],
+    });
+    const state = await fetchState(localMonitor);
+
+    // The peer resolves the flag before sending, so the receiving side only has
+    // to accept "testing" as a state it already knows.
+    expect(state.peers[0]?.snapshot?.leases[0]?.agent_state).toBe("testing");
+  });
+
+  test("degrades an unreachable peer to a marked entry without breaking local state", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    // Nothing listens on the peer port; startFakePeer picks a real port and
+    // stops it immediately so the address is guaranteed dead.
+    const deadUrl = startFakePeer(() => new Response("never"));
+    await fakePeerServers.pop()?.stop(true);
+
+    const monitor = startTestMonitor(dbPath, { peers: [deadUrl] });
+    const state = await fetchState(monitor);
+
+    expect(state.agent_count).toBe(1);
+    expect(state.peers[0]).toMatchObject({
+      url: deadUrl,
+      hostname: null,
+      reachable: false,
+      error: "unreachable",
+      snapshot: null,
+    });
+  });
+
+  test("classifies peer HTTP errors, invalid payloads, and timeouts", async () => {
+    const errorUrl = startFakePeer(() => new Response("boom", { status: 500 }));
+    const garbageUrl = startFakePeer(() => new Response("not json"));
+    const slowUrl = startFakePeer(async () => {
+      await Bun.sleep(2_000);
+      return Response.json({});
+    });
+
+    const monitor = startTestMonitor(temporaryDatabasePath(), {
+      peers: [errorUrl, garbageUrl, slowUrl],
+      peerTimeoutMs: 150,
+    });
+    const state = await fetchState(monitor);
+
+    expect(state.peers.map((peer) => peer.error)).toEqual([
+      "http_error",
+      "invalid_payload",
+      "timeout",
+    ]);
+    expect(state.peers.every((peer) => peer.snapshot === null)).toBeTrue();
+  });
+
+  test("bounds and sanitizes hostile peer payloads", async () => {
+    const nowMs = Date.now();
+    const hostileLease = (index: number, overrides: Record<string, unknown> = {}) => ({
+      agent_id: "agent-" + index,
+      agent_label: "Agent",
+      client_surface: "made-up-surface",
+      agent_state: "working",
+      // Long but under the total-body cap even times 252 leases; the per-field
+      // bound must still truncate it.
+      summary: "s".repeat(1_000),
+      // A peer monitor can claim anything is an "emoji"; only a real single
+      // emoji may reach the page.
+      emoji: "NOT AN EMOJI, JUST A BANNER",
+      repo_name: "repo-\u202edoc.txt",
+      worktree_root: "/peer/code",
+      branch: null,
+      head_oid: null,
+      dirty: "yes",
+      dirty_count: 3,
+      dirty_paths: Array.from({ length: 100 }, (_, i) => "path-" + i),
+      metadata_complete: true,
+      timebox_seconds: 900,
+      created_at_ms: nowMs,
+      updated_at_ms: nowMs,
+      expires_at_ms: nowMs + 60_000,
+      claims: [
+        { path: "ok", access: "root" },
+        { path: "", access: "exclusive" },
+      ],
+      ...overrides,
+    });
+    const hostileUrl = startFakePeer(() =>
+      Response.json({
+        now_ms: nowMs,
+        hostname: "evil\u202ehost",
+        home_dir: "/home/peer",
+        database_available: true,
+        schema_version: 2,
+        agent_count: 999,
+        leases: [
+          // Special rows first: the 200-item cap slices before sanitizing.
+          hostileLease(999, { expires_at_ms: nowMs - 1 }),
+          hostileLease(1000, { expires_at_ms: nowMs + 365 * 24 * 60 * 60 * 1_000 }),
+          ...Array.from({ length: 250 }, (_, index) => hostileLease(index)),
+        ],
+        event_count: 10_000,
+        events_truncated: 0,
+        events: [
+          { created_at_ms: nowMs, summary: "e", emoji: "‮🐛", status: "weird", event_type: "renewed" },
+        ],
+        peers: [{ url: "http://should-not-nest" }],
+      }),
+    );
+
+    const monitor = startTestMonitor(temporaryDatabasePath(), { peers: [hostileUrl] });
+    const state = await fetchState(monitor);
+    const snapshot = state.peers[0]?.snapshot;
+
+    expect(state.peers[0]?.reachable).toBeTrue();
+    // Directional-formatting characters are stripped from every text field.
+    expect(state.peers[0]?.hostname).toBe("evil host");
+    // 200 rows survive the cap; the already-expired one is then dropped.
+    expect(snapshot?.leases.length).toBe(199);
+    expect(snapshot?.agent_count).toBe(199);
+    expect(snapshot?.leases.some((entry) => entry.agent_id === "agent-999")).toBeFalse();
+    const lease = snapshot?.leases[0];
+    expect(lease?.summary.length).toBe(200);
+    expect(lease?.emoji).toBeNull();
+    expect(lease?.repo_name).toBe("repo- doc.txt");
+    expect(lease?.client_surface).toBe("unknown");
+    expect(lease?.dirty).toBeNull();
+    expect(lease?.dirty_paths.length).toBe(40);
+    expect(lease?.claims).toEqual([{ path: "ok", access: "shared" }]);
+    // A far-future expiry is clamped instead of pinning the card for a year.
+    const clampedLease = snapshot?.leases.find((entry) => entry.agent_id === "agent-1000");
+    expect(clampedLease?.expires_at_ms).toBeLessThanOrEqual(Date.now() + 3 * 60 * 60 * 1_000);
+    expect(snapshot?.events[0]?.status).toBe("granted");
+    expect(snapshot?.events[0]?.emoji).toBeNull();
+    expect(snapshot?.event_count).toBe(10_000);
+    expect(snapshot?.events_truncated).toBe(9_999);
+    expect(JSON.stringify(state)).not.toContain("should-not-nest");
   });
 
   test("rejects non-loopback Host headers to block DNS rebinding", async () => {

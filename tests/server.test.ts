@@ -38,11 +38,18 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(instructions).toBeTruthy();
   expect(instructions).toContain("announce");
   expect(instructions).toContain("untrusted data");
+  // The completing call is also the caller's last read of the frequency, so the
+  // directive has to say when to make it, not just that it releases claims.
+  expect(instructions).toContain("closing summary");
+  // Agents otherwise narrate every peer they see back to the user, which turns
+  // ambient presence into noise in reports.
+  expect(instructions).toContain("not material for your reports");
 
   const first = await codex.callTool({
     name: "announce",
     arguments: {
       summary: "Edit flight plan",
+      emoji: "🐛",
       cwd: directory,
       scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
       timebox: "15m",
@@ -52,6 +59,10 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     name: "announce",
     arguments: {
       summary: "Review flight plan",
+      // Not a single emoji, and longer than sanitizeEmoji's 32-unit cap: the
+      // call must still succeed rather than fail input validation, just
+      // without an emoji.
+      emoji: "definitely not an emoji, and far too long to ever be one",
       cwd: directory,
       scopes: [{ path: "flight-plan.txt", access: "shared" }],
       timebox: "15m",
@@ -63,9 +74,14 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(first.isError).not.toBeTrue();
   expect(firstOutput?.status).toBe("granted");
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.surface).toBe("cli");
+  expect((firstOutput?.self as Record<string, unknown> | undefined)?.emoji).toBe("🐛");
   expect(second.isError).not.toBeTrue();
   expect(secondOutput?.status).toBe("blocked");
   expect(secondOutput?.peers).toBeArrayOfSize(1);
+  // An unusable emoji is dropped rather than failing a coordination call, and
+  // the peer's real one still crosses the process boundary.
+  expect((secondOutput?.self as Record<string, unknown> | undefined)?.emoji).toBeNull();
+  expect((secondOutput?.peers as Array<Record<string, unknown>>)[0]?.emoji).toBe("🐛");
   expect(secondOutput?.traffic_scope).toBe("worktree");
 
   const unrelatedDirectory = mkdtempSync(join(tmpdir(), "agent-frequency-unrelated-test-"));
@@ -120,6 +136,43 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(expandedOutput.traffic_scope).toBe("machine");
   expect(expandedOutput.peers).toBeArrayOfSize(2);
 
+  // Testing hands the file back over a real connection: the same scope that
+  // blocked Claude above stays visible but stops arbitrating.
+  const testing = await codex.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Verifying the flight plan edit",
+      cwd: directory,
+      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+      timebox: "15m",
+      lease_id: (firstOutput?.self as Record<string, unknown>).lease_id,
+      state: "testing",
+    },
+  });
+  const testingOutput = testing.structuredContent as Record<string, unknown> | undefined;
+  expect(testing.isError).not.toBeTrue();
+  expect(testingOutput?.self).toMatchObject({
+    active: true,
+    state: "testing",
+    granted_scopes: [{ path: "flight-plan.txt", access: "shared" }],
+  });
+
+  const duringTesting = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Edit flight plan while Codex verifies",
+      cwd: directory,
+      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+      timebox: "15m",
+      lease_id: secondLeaseId,
+    },
+  });
+  const duringTestingOutput = duringTesting.structuredContent as Record<string, unknown>;
+  expect(duringTestingOutput.status).toBe("granted");
+  expect(
+    (duringTestingOutput.warnings as Array<{ code: string }>).map((warning) => warning.code),
+  ).toContain("TESTING_SCOPE_OVERLAP");
+
   const completion = await codex.callTool({
     name: "announce",
     arguments: {
@@ -145,21 +198,43 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     },
   });
   expect(afterCompletion.isError).not.toBeTrue();
-  expect((afterCompletion.structuredContent as Record<string, unknown>)?.status).toBe("granted");
+  const afterCompletionOutput = afterCompletion.structuredContent as Record<string, unknown>;
+  expect(afterCompletionOutput?.status).toBe("granted");
+  // Claude's renewal is a delta since its own last announcement, so the
+  // departed Codex must arrive as a recent peer across the process boundary.
+  expect(
+    (afterCompletionOutput?.recent_peers as Array<Record<string, unknown>>).map(
+      (peer) => peer.outcome,
+    ),
+  ).toEqual(["completed"]);
+  expect(
+    (afterCompletionOutput?.recent_peers as Array<Record<string, unknown>>)[0]?.summary,
+  ).toBe("Finished flight plan");
 
   const database = new Database(dbPath, { readonly: true });
   const events = database
-    .query("SELECT status, client_surface, agent_state FROM activity_events ORDER BY event_id ASC")
-    .all() as Array<{ status: string; client_surface: string; agent_state: string }>;
+    .query(
+      "SELECT status, client_surface, agent_state, testing FROM activity_events ORDER BY event_id ASC",
+    )
+    .all() as Array<{
+      status: string;
+      client_surface: string;
+      agent_state: string;
+      testing: number;
+    }>;
   database.close(false);
+  // The testing announcement stores the v2 "working" state plus the additive
+  // flag, so an older process reading this row still sees a live agent.
   expect(events).toEqual([
-    { status: "granted", client_surface: "cli", agent_state: "working" },
-    { status: "blocked", client_surface: "cli", agent_state: "working" },
-    { status: "granted", client_surface: "cli", agent_state: "working" },
-    { status: "blocked", client_surface: "cli", agent_state: "working" },
-    { status: "blocked", client_surface: "cli", agent_state: "working" },
-    { status: "granted", client_surface: "cli", agent_state: "done" },
-    { status: "granted", client_surface: "cli", agent_state: "working" },
+    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "granted", client_surface: "cli", agent_state: "working", testing: 1 },
+    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "granted", client_surface: "cli", agent_state: "done", testing: 0 },
+    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
   ]);
 });
 

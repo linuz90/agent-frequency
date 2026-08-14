@@ -5,6 +5,7 @@ import { Database } from "bun:sqlite";
 
 import type { ClientSurface } from "./client-surface";
 import { sanitizeSummary } from "./coordinate";
+import { sanitizeEmoji } from "./emoji";
 import { AgentFrequencyStore, defaultDatabasePath } from "./store";
 import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox } from "./types";
 
@@ -70,6 +71,9 @@ interface DemoAnnouncement {
   /** Minutes before the seed instant; live leases stay inside their timebox. */
   minutesAgo: number;
   summary: string;
+  /** The task emoji a real agent would announce; omitted on some rows so the
+   *  monitor keeps exercising the no-emoji layout. */
+  emoji?: string;
   scopes?: Scope[];
   timebox?: Timebox;
   state?: AgentState;
@@ -172,6 +176,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "dex",
     minutesAgo: 170,
     summary: "Extend the rate limiter with per-token buckets",
+    emoji: "🚦",
     scopes: [{ path: "src/limits", access: "exclusive" }],
     timebox: "1h",
   },
@@ -179,14 +184,16 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "eve",
     minutesAgo: 152,
     summary: "Backfill rate limit regression tests",
+    emoji: "🧪",
     scopes: [{ path: "tests/limits.test.ts", access: "exclusive" }],
     timebox: "30m",
   },
-  { agent: "eve", minutesAgo: 138, summary: "Rate limit tests landed", state: "done" },
+  { agent: "eve", minutesAgo: 138, summary: "Rate limit tests landed", emoji: "✅", state: "done" },
   {
     agent: "gus",
     minutesAgo: 96,
     summary: "Bump the Terraform provider lockfile across every stack",
+    emoji: "📦",
     scopes: [{ path: ".", access: "exclusive" }],
     timebox: "30m",
   },
@@ -194,20 +201,23 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "fin",
     minutesAgo: 74,
     summary: "Read through the editor toolbar before touching anything",
+    emoji: "👀",
     timebox: "15m",
   },
   {
     agent: "bo",
     minutesAgo: 58,
     summary: "Refactor the checkout summary rendering",
+    emoji: "🧹",
     scopes: [{ path: "src/app/checkout", access: "shared" }],
     timebox: "30m",
   },
-  { agent: "dex", minutesAgo: 41, summary: "Per-token buckets shipped", state: "done" },
+  { agent: "dex", minutesAgo: 41, summary: "Per-token buckets shipped", emoji: "🚀", state: "done" },
   {
     agent: "ada",
     minutesAgo: 25,
     summary: "Rework invoice totals and the checkout summary they feed",
+    emoji: "🧾",
     scopes: [
       { path: "src/app/checkout", access: "shared" },
       { path: "src/billing", access: "exclusive" },
@@ -216,6 +226,7 @@ const TIMELINE: DemoAnnouncement[] = [
   },
   // Same worktree as ada, and asks for the same exclusive path: one scope is
   // granted and one is blocked, so the feed carries a `partial` announcement.
+  // No emoji here on purpose: the monitor must stay tidy without one.
   {
     agent: "bo",
     minutesAgo: 22,
@@ -230,6 +241,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "cyd",
     minutesAgo: 18,
     summary: "Add PDF export to the billing worktree",
+    emoji: "📄",
     scopes: [{ path: "src/billing/pdf.ts", access: "exclusive" }],
     timebox: "1h",
   },
@@ -237,6 +249,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "hana",
     minutesAgo: 14,
     summary: "Migrate note storage to SQLite in a detached checkout",
+    emoji: "🗄️",
     scopes: [{ path: "app/storage", access: "exclusive" }],
     timebox: "30m",
   },
@@ -246,6 +259,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "fin",
     minutesAgo: 9,
     summary: 'Escape <script> tags & "quoted" paths in the note parser',
+    emoji: "🛡️",
     scopes: [{ path: "app/editor", access: "shared" }],
     timebox: "2h",
   },
@@ -253,6 +267,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "ada",
     minutesAgo: 6,
     summary: "Rework invoice totals, now including PDF export",
+    emoji: "🧾",
     scopes: [
       { path: "src/app/checkout", access: "shared" },
       { path: "src/billing", access: "exclusive" },
@@ -260,10 +275,23 @@ const TIMELINE: DemoAnnouncement[] = [
     timebox: "2h",
     renew: true,
   },
+  // The verification phase: fin keeps its lease and its paths on the board but
+  // stops claiming them, so the monitor has a testing agent to render.
+  {
+    agent: "fin",
+    minutesAgo: 4,
+    summary: "Run the note parser suite before handing the editor back",
+    emoji: "🧪",
+    scopes: [{ path: "app/editor", access: "shared" }],
+    timebox: "2h",
+    state: "testing",
+    renew: true,
+  },
   {
     agent: "gus",
     minutesAgo: 3,
     summary: "Roll the provider bump back out one stack at a time",
+    emoji: "🔁",
     scopes: [{ path: "stacks/prod", access: "exclusive" }],
     timebox: "15m",
   },
@@ -271,6 +299,7 @@ const TIMELINE: DemoAnnouncement[] = [
     agent: "dex",
     minutesAgo: 1,
     summary: "Trace a flaky auth test before changing anything",
+    emoji: "🐛",
     timebox: "1h",
   },
 ];
@@ -310,6 +339,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
       // Demo summaries go through the same validation as real ones so the
       // fixtures can never render something a real announcement could not.
       summary: sanitizeSummary(entry.summary),
+      emoji: sanitizeEmoji(entry.emoji),
       metadata: demoMetadata(worktree, home),
       scopes: entry.scopes ?? [],
       timebox: entry.timebox ?? "1h",

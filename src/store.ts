@@ -6,10 +6,12 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { normalizeClientSurface, type ClientSurface } from "./client-surface";
+import { MAX_EMOJI_LENGTH } from "./emoji";
 import { normalizeScopes, scopesOverlap } from "./scopes";
 import {
   TIMEBOX_SECONDS,
-  normalizeAgentState,
+  agentStateFromLease,
+  type AgentState,
   type AnnounceOutput,
   type BlockedScope,
   type Blocker,
@@ -17,6 +19,7 @@ import {
   type HiddenPeerCounts,
   type Peer,
   type PeerRelation,
+  type RecentPeer,
   type Scope,
   type StoreAnnounceRequest,
 } from "./types";
@@ -32,6 +35,12 @@ const MAX_DIRTY_PATHS = 40;
 // and local paths into an unbounded archive.
 const MAX_ACTIVITY_EVENTS = 1_000;
 const ACTIVITY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+// Recently departed agents surfaced in announce responses. The cap keeps the
+// orientation cost of a fresh lease small; the window is one working day, long
+// enough to explain "who changed this since I last looked" after an overnight
+// gap, and far shorter than activity retention.
+const MAX_RECENT_PEERS = 5;
+const RECENT_PEER_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const SCHEMA_VERSION = 2;
 const BUSY_RETRY_DELAYS_MS = [0, 25, 100, 250] as const;
 
@@ -45,7 +54,9 @@ interface LeaseRow {
   agent_label: string;
   client_surface: ClientSurface | string;
   agent_state: string;
+  testing: number | null;
   summary: string;
+  emoji: string | null;
   project_id: string;
   local_repo_id: string;
   repo_name: string;
@@ -74,6 +85,7 @@ interface EvaluatedScope {
   scope: Scope;
   blockers: Blocker[];
   sharedOverlaps: Array<{ agentId: string; path: string }>;
+  testingOverlaps: Array<{ agentId: string; path: string }>;
 }
 
 interface PeerCandidate extends Peer {
@@ -143,11 +155,15 @@ export class AgentFrequencyStore {
     // Completion is a lifecycle signal, not another claim request. Ignoring
     // stale caller scopes also lets an agent release its lease after moving or
     // deleting paths that were valid when the work started.
-    const scopes = request.state === "done" ? [] : normalizeScopes(request.scopes);
+    const scopes =
+      request.state === "done" ? [] : asAdvisoryScopes(normalizeScopes(request.scopes), request.state);
     const timeboxSeconds = TIMEBOX_SECONDS[request.timebox];
     const expiresAtMs = nowMs + timeboxSeconds * 1_000;
     let leaseId = request.leaseId ?? randomBytes(16).toString("hex");
     let renewed = false;
+    // When this call renews a lease, recent traffic is reported as a delta
+    // since the caller last listened; a fresh lease gets the full window.
+    let priorUpdatedAtMs: number | null = null;
 
     let transactionOpen = false;
     try {
@@ -177,6 +193,7 @@ export class AgentFrequencyStore {
           throw new Error("lease_id cannot be renewed in a different project");
         } else {
           renewed = true;
+          priorUpdatedAtMs = existing.updated_at_ms;
         }
       }
 
@@ -220,6 +237,10 @@ export class AgentFrequencyStore {
       const peers = peerCandidates.map(stripPeerCandidate);
       const warnings = this.buildWarnings(request, scopes, evaluations, peers);
       const visible = this.selectVisiblePeers(peerCandidates, request, scopes);
+      const recentPeers = this.getRecentPeers(
+        request,
+        priorUpdatedAtMs ?? nowMs - RECENT_PEER_WINDOW_MS,
+      );
       const status =
         blockedScopes.length === 0
           ? "granted"
@@ -227,6 +248,7 @@ export class AgentFrequencyStore {
             ? "blocked"
             : "partial";
 
+      const retryAtMs = latestBlockerExpiryMs(blockedScopes);
       const output: AnnounceOutput = {
         status,
         snapshot_at: toIso(nowMs),
@@ -235,9 +257,10 @@ export class AgentFrequencyStore {
           lease_id: leaseId,
           renewed,
           active: true,
-          state: "working",
+          state: request.state,
           agent_id: request.agentId,
           surface: request.clientSurface,
+          emoji: request.emoji ?? null,
           expires_at: toIso(expiresAtMs),
           renew_after: toIso(nowMs + Math.floor((timeboxSeconds * 1_000 * 2) / 3)),
           timebox: request.timebox,
@@ -250,10 +273,19 @@ export class AgentFrequencyStore {
           blocked_scopes: blockedScopes,
         },
         peers: visible.peers,
+        recent_peers: recentPeers,
         hidden_peers: visible.hiddenPeers,
         peers_truncated: visible.truncated,
         warnings,
-        message: statusMessage(status, grantedScopes.length, blockedScopes.length),
+        retry_at: retryAtMs === null ? null : toIso(retryAtMs),
+        message: statusMessage(
+          status,
+          request.state,
+          grantedScopes.length,
+          blockedScopes.length,
+          retryAtMs,
+          nowMs,
+        ),
       };
 
       this.recordActivity(request, output, scopes.length, peers.length, nowMs);
@@ -275,6 +307,11 @@ export class AgentFrequencyStore {
   }
 
   private completeAnnouncement(request: StoreAnnounceRequest, nowMs: number): AnnounceOutput {
+    // Captured before deletion: the completing call reports recent traffic as
+    // a delta since the caller last listened. Without a live lease there is no
+    // "since", and a closing call is the wrong moment for a 24h orientation
+    // dump, so an unknown lease_id gets no recent peers at all.
+    let priorUpdatedAtMs: number | null = null;
     if (request.leaseId) {
       const existing = this.getLeaseRow(request.leaseId);
       if (
@@ -286,6 +323,7 @@ export class AgentFrequencyStore {
         throw new Error("lease_id cannot be completed in a different project");
       }
       if (existing) {
+        priorUpdatedAtMs = existing.updated_at_ms;
         // Claims cascade with the lease, so completion releases every granted
         // path atomically before the returned peer snapshot is built.
         this.database.query("DELETE FROM leases WHERE lease_id = ?").run(request.leaseId);
@@ -316,6 +354,7 @@ export class AgentFrequencyStore {
         state: "done",
         agent_id: request.agentId,
         surface: request.clientSurface,
+        emoji: request.emoji ?? null,
         expires_at: null,
         renew_after: null,
         timebox: null,
@@ -328,9 +367,12 @@ export class AgentFrequencyStore {
         blocked_scopes: [],
       },
       peers: visible.peers,
+      recent_peers:
+        priorUpdatedAtMs === null ? [] : this.getRecentPeers(request, priorUpdatedAtMs),
       hidden_peers: visible.hiddenPeers,
       peers_truncated: visible.truncated,
       warnings: this.buildWarnings(request, [], [], peers),
+      retry_at: null,
       message: "Completion announced; active lease and claims released",
     };
   }
@@ -343,6 +385,84 @@ export class AgentFrequencyStore {
          ORDER BY updated_at_ms DESC, agent_id ASC, lease_id ASC`,
       )
       .all(excludedLeaseId) as LeaseRow[];
+  }
+
+  /**
+   * Recently departed agents, reconstructed from the activity feed: the latest
+   * event per agent-and-worktree newer than sinceMs, for agents that no longer
+   * hold an active lease there. Answers "who was here, and did they finish?"
+   * — the question an agent faces when it finds working-tree changes that no
+   * active peer claims. Display-only by design: arbitration never reads
+   * events, and entries carry no scopes to respect.
+   *
+   * Traffic scoping mirrors peer visibility, with one honest weakening: events
+   * retain no origin identity, so `project` matches by repo_name rather than
+   * by the normalized origin used for live peers. Fine for orientation
+   * context; never used for safety decisions.
+   */
+  private getRecentPeers(request: StoreAnnounceRequest, sinceMs: number): RecentPeer[] {
+    const scopeCondition =
+      request.trafficScope === "worktree"
+        ? "AND events.worktree_root = $worktree"
+        : request.trafficScope === "project"
+          ? "AND events.repo_name = $repo"
+          : "";
+    const rows = this.database
+      .query(
+        // The latest-event subquery is deliberately unwindowed: in-window rows
+        // are newer than any pre-window row, so if the pair's true latest event
+        // is outside the window the pair simply drops out, never misattributed
+        // to an older row. Expired leases are already deleted at announce
+        // start, so a bare NOT EXISTS excludes exactly the still-active agents
+        // the peers array reports.
+        `SELECT * FROM activity_events AS events
+         WHERE events.created_at_ms > $since
+           AND events.agent_id != $agentId
+           ${scopeCondition}
+           AND events.event_id = (
+             SELECT max(latest.event_id) FROM activity_events AS latest
+             WHERE latest.agent_id = events.agent_id
+               AND latest.worktree_root = events.worktree_root
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM leases
+             WHERE leases.agent_id = events.agent_id
+               AND leases.worktree_root = events.worktree_root
+           )
+         ORDER BY events.created_at_ms DESC, events.event_id DESC
+         LIMIT ${MAX_RECENT_PEERS}`,
+      )
+      .all({
+        since: sinceMs,
+        agentId: request.agentId,
+        ...(request.trafficScope === "worktree"
+          ? { worktree: request.metadata.worktreeRoot }
+          : request.trafficScope === "project"
+            ? { repo: request.metadata.repoName }
+            : {}),
+      }) as Array<{
+        agent_id: string;
+        agent_label: string;
+        client_surface: string;
+        agent_state: string;
+        emoji: string | null;
+        summary: string;
+        repo_name: string;
+        branch: string | null;
+        created_at_ms: number;
+      }>;
+
+    return rows.map((row) => ({
+      agent_id: row.agent_id,
+      label: row.agent_label,
+      surface: normalizeClientSurface(row.client_surface),
+      emoji: row.emoji,
+      summary: row.summary,
+      outcome: row.agent_state === "done" ? "completed" : "expired",
+      repo: row.repo_name,
+      branch: row.branch,
+      last_heard: toIso(row.created_at_ms),
+    }));
   }
 
   private getClaimsByLease(leaseIds: string[]): Map<string, Scope[]> {
@@ -376,6 +496,7 @@ export class AgentFrequencyStore {
   ): EvaluatedScope {
     const blockers: Blocker[] = [];
     const sharedOverlaps: EvaluatedScope["sharedOverlaps"] = [];
+    const testingOverlaps: EvaluatedScope["testingOverlaps"] = [];
 
     for (const peer of peers) {
       const relation = relationTo(peer, request);
@@ -384,17 +505,27 @@ export class AgentFrequencyStore {
       if (relation === "other_project") {
         continue;
       }
-      for (const existing of claimsByLease.get(peer.lease_id) ?? []) {
+      // A testing peer has stopped editing, so its paths are advertisement
+      // rather than a claim: they still surface as a warning, because edits
+      // underneath a running verification can invalidate it, but they never
+      // block. That is the point of the state — hand the files back early.
+      const peerClaims = claimsByLease.get(peer.lease_id) ?? [];
+      const peerTesting =
+        agentStateFromLease(peer.agent_state, peer.testing, peerClaims) === "testing";
+      for (const existing of peerClaims) {
         if (!scopesOverlap(incoming, existing, request.metadata.ignoreCase || Boolean(peer.ignore_case))) {
           continue;
         }
-        if (incoming.access === "exclusive" || existing.access === "exclusive") {
+        if (peerTesting) {
+          testingOverlaps.push({ agentId: peer.agent_id, path: existing.path });
+        } else if (incoming.access === "exclusive" || existing.access === "exclusive") {
           blockers.push({
             agent_id: peer.agent_id,
             relation,
             path: existing.path,
             access: existing.access,
             expires_at: toIso(peer.expires_at_ms),
+            updated_at: toIso(peer.updated_at_ms),
           });
         } else {
           sharedOverlaps.push({ agentId: peer.agent_id, path: existing.path });
@@ -403,10 +534,9 @@ export class AgentFrequencyStore {
     }
 
     blockers.sort(compareBlockers);
-    sharedOverlaps.sort(
-      (left, right) => left.agentId.localeCompare(right.agentId) || left.path.localeCompare(right.path),
-    );
-    return { scope: incoming, blockers, sharedOverlaps };
+    sharedOverlaps.sort(compareOverlaps);
+    testingOverlaps.sort(compareOverlaps);
+    return { scope: incoming, blockers, sharedOverlaps, testingOverlaps };
   }
 
   private upsertLease(
@@ -420,16 +550,18 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO leases (
-           lease_id, agent_id, agent_label, client_surface, agent_state, summary, project_id, local_repo_id, repo_name,
+           lease_id, agent_id, agent_label, client_surface, agent_state, testing, summary, emoji, project_id, local_repo_id, repo_name,
            worktree_id, worktree_root, branch, head_oid, ignore_case, dirty, dirty_count,
            dirty_paths, metadata_complete, timebox_seconds, created_at_ms, updated_at_ms, expires_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(lease_id) DO UPDATE SET
            agent_id = excluded.agent_id,
            agent_label = excluded.agent_label,
            client_surface = excluded.client_surface,
            agent_state = excluded.agent_state,
+           testing = excluded.testing,
            summary = excluded.summary,
+           emoji = excluded.emoji,
            project_id = excluded.project_id,
            local_repo_id = excluded.local_repo_id,
            repo_name = excluded.repo_name,
@@ -451,8 +583,10 @@ export class AgentFrequencyStore {
         request.agentId,
         request.agentLabel,
         request.clientSurface,
-        request.state,
+        storedAgentState(request.state),
+        request.state === "testing" ? 1 : 0,
         request.summary,
+        request.emoji ?? null,
         metadata.projectId,
         metadata.localRepoId,
         metadata.repoName,
@@ -482,8 +616,14 @@ export class AgentFrequencyStore {
         agent_id: row.agent_id,
         label: row.agent_label,
         surface: normalizeClientSurface(row.client_surface),
-        state: normalizeAgentState(row.agent_state),
+        state: agentStateFromLease(
+          row.agent_state,
+          row.testing,
+          claimsByLease.get(row.lease_id) ?? [],
+        ),
         summary: row.summary,
+        // Older processes never write the column, so treat missing as none.
+        emoji: row.emoji ?? null,
         relation: relationTo(row, request),
         repo: row.repo_name,
         worktree: row.worktree_root,
@@ -491,6 +631,7 @@ export class AgentFrequencyStore {
         dirty: fromNullableBoolean(row.dirty),
         dirty_paths: parseDirtyPaths(row.dirty_paths),
         expires_at: toIso(row.expires_at_ms),
+        updated_at: toIso(row.updated_at_ms),
         scopes: claimsByLease.get(row.lease_id) ?? [],
         ignoreCase: Boolean(row.ignore_case),
         updatedAtMs: row.updated_at_ms,
@@ -560,6 +701,23 @@ export class AgentFrequencyStore {
       });
     }
 
+    const testingOverlaps = evaluations.flatMap((evaluation) =>
+      evaluation.testingOverlaps.map((overlap) => ({ incoming: evaluation.scope.path, ...overlap })),
+    );
+    if (testingOverlaps.length > 0) {
+      const descriptions = [
+        ...new Set(
+          testingOverlaps.map(
+            (overlap) => `${overlap.incoming} with ${overlap.agentId}:${overlap.path}`,
+          ),
+        ),
+      ];
+      warnings.push({
+        code: "TESTING_SCOPE_OVERLAP",
+        message: `Agents are testing overlapping paths, so your edits can invalidate their run: ${descriptions.join(", ")}`,
+      });
+    }
+
     const sameWorktreeAgents = uniqueAgentIds(
       peers.filter((peer) => peer.relation === "same_worktree"),
     );
@@ -613,10 +771,10 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO activity_events (
-           event_type, status, agent_id, agent_label, client_surface, agent_state, summary, repo_name,
+           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, summary, emoji, repo_name,
            worktree_root, branch, requested_scope_count, granted_scope_count,
            blocked_scope_count, peer_count, created_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         request.state === "done" ? "announced" : output.self.renewed ? "renewed" : "announced",
@@ -624,8 +782,10 @@ export class AgentFrequencyStore {
         request.agentId,
         request.agentLabel,
         request.clientSurface,
-        request.state,
+        storedAgentState(request.state),
+        request.state === "testing" ? 1 : 0,
         request.summary,
+        request.emoji ?? null,
         request.metadata.repoName,
         request.metadata.worktreeRoot,
         request.metadata.branch,
@@ -650,6 +810,30 @@ export class AgentFrequencyStore {
       )
       .run(MAX_ACTIVITY_EVENTS);
   }
+}
+
+// A testing agent is verifying what it already wrote, so it holds no locks:
+// its paths are recorded as shared advertisements that peers can see and edit
+// through. Requested access is downgraded rather than rejected so an agent can
+// hand the same scope list back with one changed field.
+function asAdvisoryScopes(scopes: Scope[], state: AgentState): Scope[] {
+  if (state !== "testing") return scopes;
+  return scopes.map((scope) =>
+    scope.access === "shared" ? scope : { path: scope.path, access: "shared" },
+  );
+}
+
+// Only "working" and "done" are storable agent_state values; see the testing
+// column comment in initializeSchema.
+function storedAgentState(state: AgentState): "working" | "done" {
+  return state === "done" ? "done" : "working";
+}
+
+function compareOverlaps(
+  left: { agentId: string; path: string },
+  right: { agentId: string; path: string },
+): number {
+  return left.agentId.localeCompare(right.agentId) || left.path.localeCompare(right.path);
 }
 
 function relationTo(peer: LeaseRow, request: StoreAnnounceRequest): PeerRelation {
@@ -758,20 +942,56 @@ function toIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
+// The latest blocker expiry, not the earliest: retry_at answers "how long
+// could I possibly have to wait?", and only the upper bound lets a caller
+// decide between waiting and escalating. Retrying earlier is always allowed.
+function latestBlockerExpiryMs(blockedScopes: BlockedScope[]): number | null {
+  let latest: number | null = null;
+  for (const scope of blockedScopes) {
+    for (const blocker of scope.blockers) {
+      const expiresMs = Date.parse(blocker.expires_at);
+      if (latest === null || expiresMs > latest) {
+        latest = expiresMs;
+      }
+    }
+  }
+  return latest;
+}
+
+function formatWaitMinutes(waitMs: number): string {
+  return `~${Math.max(1, Math.round(waitMs / 60_000))}m`;
+}
+
+// Blocked callers tend to escalate to their human when the response gives no
+// decision rule. retry_at bounds the worst-case wait, so tell the caller
+// directly when waiting beats interrupting the user.
+function retryAdvice(retryAtMs: number | null, nowMs: number): string {
+  if (retryAtMs === null) return "";
+  return ` Every blocker lease expires within ${formatWaitMinutes(retryAtMs - nowMs)} (retry_at) and may release sooner via done; if you can wait, re-announce these scopes to retry instead of interrupting the user`;
+}
+
 function statusMessage(
   status: Exclude<AnnounceOutput["status"], "completed">,
+  state: AgentState,
   grantedCount: number,
   blockedCount: number,
+  retryAtMs: number | null,
+  nowMs: number,
 ): string {
+  if (status === "granted" && state === "testing") {
+    return grantedCount === 0
+      ? "Testing announced; no paths advertised and no claims held"
+      : `Testing announced; ${grantedCount} path${grantedCount === 1 ? " is" : "s are"} advertised but no longer claimed, so peers can edit them`;
+  }
   if (status === "granted") {
     return grantedCount === 0
       ? "Traffic received; no scopes claimed and no known conflict"
       : `No known conflict for ${grantedCount} announced scope${grantedCount === 1 ? "" : "s"}`;
   }
   if (status === "partial") {
-    return `No known conflict on ${grantedCount} scope${grantedCount === 1 ? "" : "s"}; coordinate before ${blockedCount}`;
+    return `No known conflict on ${grantedCount} scope${grantedCount === 1 ? "" : "s"}; coordinate before ${blockedCount}.${retryAdvice(retryAtMs, nowMs)}`;
   }
-  return `Coordinate before editing; ${blockedCount} requested scope${blockedCount === 1 ? " is" : "s are"} blocked`;
+  return `Coordinate before editing; ${blockedCount} requested scope${blockedCount === 1 ? " is" : "s are"} blocked.${retryAdvice(retryAtMs, nowMs)}`;
 }
 
 function withBusyRetry<T>(operation: () => T): T {
@@ -844,6 +1064,38 @@ function initializeSchema(database: Database): void {
       "agent_state",
       "TEXT NOT NULL DEFAULT 'working' CHECK (agent_state IN ('working', 'done'))",
     );
+    // "testing" is a third agent state, but widening the agent_state CHECK
+    // means recreating both tables, which drops every live lease and the whole
+    // seven-day activity feed and makes already-running v2 processes fail on
+    // their next announce. An additive flag keeps all of that alive: older
+    // processes simply never set it, and their rows read back as "working".
+    addColumnIfMissing(
+      database,
+      "leases",
+      "testing",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1))",
+    );
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "testing",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1))",
+    );
+    // The task emoji is display-only, so it stays additive and nullable for the
+    // same reason: rolling it out must not drop a live lease or the feed, and
+    // rows written by an older process simply carry no emoji.
+    addColumnIfMissing(
+      database,
+      "leases",
+      "emoji",
+      `TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH})`,
+    );
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "emoji",
+      `TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH})`,
+    );
     if (row.user_version !== SCHEMA_VERSION) {
       database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     }
@@ -877,7 +1129,9 @@ CREATE TABLE IF NOT EXISTS leases (
     CHECK (client_surface IN ('t3-code', 'codex-app', 'claude-app', 'cli', 'unknown')),
   agent_state TEXT NOT NULL DEFAULT 'working'
     CHECK (agent_state IN ('working', 'done')),
+  testing INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1)),
   summary TEXT NOT NULL,
+  emoji TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH}),
   project_id TEXT NOT NULL,
   local_repo_id TEXT NOT NULL,
   repo_name TEXT NOT NULL,
@@ -921,7 +1175,9 @@ CREATE TABLE IF NOT EXISTS activity_events (
     CHECK (client_surface IN ('t3-code', 'codex-app', 'claude-app', 'cli', 'unknown')),
   agent_state TEXT NOT NULL DEFAULT 'working'
     CHECK (agent_state IN ('working', 'done')),
+  testing INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1)),
   summary TEXT NOT NULL,
+  emoji TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH}),
   repo_name TEXT NOT NULL,
   worktree_root TEXT NOT NULL,
   branch TEXT,

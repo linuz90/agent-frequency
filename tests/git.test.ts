@@ -54,7 +54,8 @@ describe("collectGitMetadata", () => {
     const httpsMetadata = await collectGitMetadata(nestedCwd);
     const canonicalRepository = await realpath(repository);
 
-    expect(httpsMetadata.repoName).toBe(basename(repository));
+    // The origin names the project, not whatever folder the checkout is in.
+    expect(httpsMetadata.repoName).toBe("AgentFrequency");
     expect(httpsMetadata.worktreeRoot).toBe(canonicalRepository);
     expect(httpsMetadata.gitDir).toBe(join(canonicalRepository, ".git"));
     expect(httpsMetadata.gitCommonDir).toBe(join(canonicalRepository, ".git"));
@@ -78,6 +79,28 @@ describe("collectGitMetadata", () => {
     expect(sshMetadata.projectId).toBe(httpsMetadata.projectId);
     expect(sshMetadata.localRepoId).toBe(httpsMetadata.localRepoId);
     expect(sshMetadata.worktreeId).toBe(httpsMetadata.worktreeId);
+  });
+
+  test("names repositories from origin or main checkout, never the worktree folder", async () => {
+    const repository = await createRepository();
+    // Managed worktrees (T3 Code, Conductor) live in generated folders whose
+    // basenames mean nothing to a human reading the monitor.
+    const worktreeContainer = await mkdtemp(join(tmpdir(), "agent-frequency-worktrees-"));
+    temporaryDirectories.push(worktreeContainer);
+    const linkedWorktree = join(worktreeContainer, "t3code-ec984bfa");
+    git(repository, "worktree", "add", linkedWorktree, "-b", "t3code/optimize-things");
+
+    // Without an origin, the main checkout's human-chosen folder name wins.
+    const withoutOrigin = await collectGitMetadata(linkedWorktree);
+    expect(withoutOrigin.repoName).toBe(basename(repository));
+    expect(withoutOrigin.branch).toBe("t3code/optimize-things");
+
+    // With an origin, the canonical name wins everywhere so clones, linked
+    // worktrees, and other machines all group under one project.
+    git(repository, "remote", "add", "origin", "git@github.com:linuz90/islands.git");
+    const withOrigin = await collectGitMetadata(linkedWorktree);
+    expect(withOrigin.repoName).toBe("islands");
+    expect((await collectGitMetadata(repository)).repoName).toBe("islands");
   });
 
   test("requires an absolute cwd in a Git worktree", async () => {

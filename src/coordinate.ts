@@ -1,3 +1,4 @@
+import { sanitizeEmoji } from "./emoji";
 import { collectGitMetadata } from "./git";
 import { AgentFrequencyStore } from "./store";
 import type { ClientSurface } from "./client-surface";
@@ -43,6 +44,9 @@ export async function coordinateAnnouncement(
       state: input.state ?? "working",
       trafficScope: input.traffic_scope ?? "worktree",
       summary: sanitizeSummary(input.summary),
+      // An unusable emoji is decoration, not coordination data: drop it and let
+      // the announcement through rather than failing a safety-relevant call.
+      emoji: sanitizeEmoji(input.emoji),
       metadata,
       scopes: input.scopes ?? [],
       timebox: input.timebox ?? "1h",

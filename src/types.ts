@@ -7,7 +7,7 @@ export const TIMEBOX_SECONDS = {
   "2h": 2 * 60 * 60,
 } as const;
 
-export const AGENT_STATES = ["working", "done"] as const;
+export const AGENT_STATES = ["working", "testing", "done"] as const;
 export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
 
 export type Timebox = keyof typeof TIMEBOX_SECONDS;
@@ -16,7 +16,36 @@ export type AgentState = (typeof AGENT_STATES)[number];
 export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
 
 export function normalizeAgentState(value: unknown): AgentState {
-  return value === "done" ? "done" : "working";
+  if (value === "done") return "done";
+  return value === "testing" ? "testing" : "working";
+}
+
+/**
+ * Storage keeps the two v2 `agent_state` values and carries "testing" in an
+ * additive flag column, so every read has to combine the two. See the schema
+ * comment in store.ts for why the state did not become a third enum value.
+ */
+export function agentStateFromRow(state: unknown, testing: unknown): AgentState {
+  return testing ? "testing" : normalizeAgentState(state);
+}
+
+/**
+ * A lease's state, cross-checked against the claims it holds. Testing releases
+ * every exclusive claim, so a lease still holding one is being edited: an
+ * older process renewing that lease writes real claims without knowing the
+ * flag column exists, which would otherwise leave a stale "testing" behind and
+ * quietly turn a genuine exclusive claim into an advisory one.
+ */
+export function agentStateFromLease(
+  state: unknown,
+  testing: unknown,
+  claims: ReadonlyArray<{ access: Access }>,
+): AgentState {
+  const resolved = agentStateFromRow(state, testing);
+  if (resolved === "testing" && claims.some((claim) => claim.access === "exclusive")) {
+    return "working";
+  }
+  return resolved;
 }
 
 export interface Scope {
@@ -26,6 +55,7 @@ export interface Scope {
 
 export interface AnnounceInput {
   summary: string;
+  emoji?: string;
   cwd: string;
   scopes?: Scope[];
   timebox?: Timebox;
@@ -62,6 +92,7 @@ export interface Blocker {
   path: string;
   access: Access;
   expires_at: string;
+  updated_at: string;
 }
 
 export interface BlockedScope extends Scope {
@@ -74,6 +105,8 @@ export interface Peer {
   surface: ClientSurface;
   state: AgentState;
   summary: string;
+  // Null when the peer announced no emoji, or one that failed validation.
+  emoji: string | null;
   relation: PeerRelation;
   repo: string;
   worktree: string;
@@ -81,11 +114,13 @@ export interface Peer {
   dirty: boolean | null;
   dirty_paths: string[];
   expires_at: string;
+  updated_at: string;
   scopes: Scope[];
 }
 
 export type WarningCode =
   | "SHARED_SCOPE_OVERLAP"
+  | "TESTING_SCOPE_OVERLAP"
   | "SAME_WORKTREE"
   | "SAME_BRANCH"
   | "INCOMPLETE_GIT_METADATA"
@@ -94,6 +129,25 @@ export type WarningCode =
 export interface CoordinationWarning {
   code: WarningCode;
   message: string;
+}
+
+// A recently departed agent, reconstructed from the bounded activity feed.
+// Display-only context: arbitration never reads these, and unlike Peer there
+// are no claims to respect — the lease behind this entry is already gone.
+export interface RecentPeer {
+  agent_id: string;
+  label: string;
+  surface: ClientSurface;
+  // Null when the agent announced no emoji, or one that failed validation.
+  emoji: string | null;
+  summary: string;
+  // "completed" when the agent's last word was a done announcement;
+  // "expired" when its lease lapsed without one — a crash or an abandoned
+  // session, so its work may be unfinished.
+  outcome: "completed" | "expired";
+  repo: string;
+  branch: string | null;
+  last_heard: string;
 }
 
 export interface AnnounceOutput {
@@ -107,6 +161,8 @@ export interface AnnounceOutput {
     state: AgentState;
     agent_id: string;
     surface: ClientSurface;
+    // Echoes the emoji as recorded, so a caller can see its value was dropped.
+    emoji: string | null;
     expires_at: string | null;
     renew_after: string | null;
     timebox: Timebox | null;
@@ -119,9 +175,18 @@ export interface AnnounceOutput {
     blocked_scopes: BlockedScope[];
   };
   peers: Peer[];
+  // Agents recently heard on this frequency whose leases have since ended.
+  // A fresh lease gets a 24h orientation window; a renewal or completion gets
+  // only what changed since the caller's previous announcement, so repeated
+  // calls stay cheap. Bounded, deduplicated, and empty in the common case.
+  recent_peers: RecentPeer[];
   hidden_peers: HiddenPeerCounts;
   peers_truncated: number;
   warnings: CoordinationWarning[];
+  // Latest blocker lease expiry when any scope is blocked, else null. The
+  // worst-case wait: every current blocker has expired by this time, and
+  // blockers may release sooner by announcing done.
+  retry_at: string | null;
   message: string;
 }
 
@@ -132,6 +197,7 @@ export interface StoreAnnounceRequest {
   state: AgentState;
   trafficScope: TrafficScope;
   summary: string;
+  emoji?: string | null;
   metadata: GitMetadata;
   scopes: Scope[];
   timebox: Timebox;

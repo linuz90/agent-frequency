@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, posix, resolve } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { stripUnsafeFormatting } from "./scopes";
@@ -109,7 +109,7 @@ export async function collectGitMetadata(cwd: string): Promise<GitMetadata> {
   return {
     projectId: stableId("project", origin ? `origin:${origin}` : `common:${gitCommonDir}`),
     localRepoId: stableId("clone", gitCommonDir),
-    repoName: basename(worktreeRoot),
+    repoName: deriveRepoName(origin, gitCommonDir, worktreeRoot),
     worktreeId: stableId("worktree", worktreeRoot),
     worktreeRoot,
     gitDir,
@@ -129,6 +129,43 @@ export async function collectGitMetadata(cwd: string): Promise<GitMetadata> {
     dirtyPaths: dirtyState?.dirtyPaths ?? [],
     metadataComplete: dirtyState !== null,
   };
+}
+
+/**
+ * Names the repository the way a human would, mirroring projectId's priority.
+ *
+ * The worktree folder is only a last resort: managed worktrees (T3 Code,
+ * Conductor, plain `git worktree add`) often live in generated directories
+ * such as `~/.t3/worktrees/islands/t3code-ec984bfa`, whose basename says
+ * nothing. The origin's last path segment is canonical and keeps every clone,
+ * linked worktree, and machine grouped under one name in the monitor.
+ */
+function deriveRepoName(
+  origin: string | null,
+  gitCommonDir: string,
+  worktreeRoot: string,
+): string {
+  if (origin) {
+    const segment = origin.split("/").filter(Boolean).at(-1);
+    if (segment) {
+      // Local origins are file:// URLs, so a folder name like "my repo"
+      // arrives percent-encoded.
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    }
+  }
+  // A linked worktree's common dir is `<main checkout>/.git`; the main
+  // checkout's folder name is the human-chosen one. For the main worktree
+  // itself this equals basename(worktreeRoot), preserving prior behavior.
+  if (basename(gitCommonDir) === ".git") {
+    return basename(dirname(gitCommonDir));
+  }
+  // Bare repositories name their directory "project.git".
+  const bareName = basename(gitCommonDir).replace(/\.git$/i, "");
+  return bareName || basename(worktreeRoot);
 }
 
 function normalizeRemotePath(rawPath: string): string {

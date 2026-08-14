@@ -1,0 +1,973 @@
+/* Stylesheet for the monitor page, spliced inline into monitor.html by
+   pageAsset() in monitor.ts so the page ships as one self-contained response. */
+
+:root {
+  --bg: #ffffff;
+  --surface: #f7f7f7;
+  --fg: #1d1d1f;
+  --fg-muted: #666666;
+  --fg-faint: #737373;
+  --border: #ebebeb;
+  --border-strong: #c7c7c7;
+  --live: #0b7a3e;
+  --warning: #9a6700;
+  --alert: #b42318;
+  --focus: #0070f3;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0a0a;
+    --surface: #151515;
+    --fg: #ededed;
+    --fg-muted: #a1a1a1;
+    --fg-faint: #929292;
+    --border: #232323;
+    --border-strong: #4a4a4a;
+    --live: #45d483;
+    --warning: #e3b341;
+    --alert: #ff8f85;
+    --focus: #52a8ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  /* Relative so mono snippets track their surrounding text size instead
+     of rendering larger than the prose next to them. */
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+}
+
+.wrap {
+  width: min(100%, 1080px);
+  margin: 0 auto;
+  padding: 28px 32px 56px;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 1;
+  top: 12px;
+  left: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  transform: translateY(-160%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 32px;
+}
+
+.identity {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.product-name {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.view-tabs {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: 6px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+}
+
+.view-tab {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tab-icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+}
+
+.view-tab[aria-selected="true"] {
+  border-bottom-color: var(--fg);
+  color: var(--fg);
+}
+
+.view-tab:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--live);
+}
+
+.live[data-state="error"] {
+  color: var(--alert);
+}
+
+.live[data-state="error"] .dot {
+  background: var(--alert);
+}
+
+.overview {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(220px, 3fr);
+  align-items: end;
+  gap: 32px;
+  padding: 72px 0 40px;
+}
+
+h1 {
+  max-width: 680px;
+  margin: 0;
+  font-size: clamp(34px, 4.5vw, 58px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.06;
+  text-wrap: balance;
+}
+
+.overview-copy {
+  max-width: 36ch;
+  margin: 0 0 3px;
+  color: var(--fg-muted);
+}
+
+.overview-aside {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.project-filter {
+  display: inline-grid;
+  grid-template-columns: 14px minmax(0, 1fr) 14px;
+  align-items: center;
+  width: min(100%, 240px);
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-muted);
+}
+
+.project-filter[hidden] {
+  display: none;
+}
+
+.project-filter:focus-within {
+  border-color: var(--focus);
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.project-filter svg {
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
+.project-filter select {
+  min-width: 0;
+  height: 100%;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 0;
+  outline: 0;
+  appearance: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.machines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.machine-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.machine-status[data-state="unreachable"] {
+  color: var(--alert);
+}
+
+.machine-status[data-state="unreachable"] .dot {
+  background: var(--alert);
+}
+
+#traffic {
+  border-top: 1px solid var(--border-strong);
+}
+
+.group {
+  padding-top: 36px;
+}
+
+.group-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.group-name {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.group-meta {
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.card {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 14px 0 15px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The section's last card needs no closing rule: the recent block below it
+   opens with its own label, and the next project opens with its own head, so
+   a full-width divider there only adds noise next to the indented content. */
+.group .card:last-of-type {
+  border-bottom: 0;
+}
+
+.agent-label {
+  max-width: 100%;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.agent-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+/* One chip language for the facts about a session — where it runs, which
+   session it is, how much lease is left. They stay quiet and uniform so
+   the summary below them is what the eye lands on. */
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 8px 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+/* The app and the machine are two halves of one fact, so they share a
+   chip. The machine carries the emphasis inside it: it is the part that
+   changes what a reader should do about the work. */
+
+.origin-app {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.origin-sep {
+  color: var(--fg-faint);
+}
+
+.origin-machine {
+  min-width: 0;
+  max-width: 18ch;
+  overflow: hidden;
+  color: var(--fg);
+  text-overflow: ellipsis;
+}
+
+.session-chip {
+  color: var(--fg-faint);
+}
+
+.card-avatar,
+.activity-avatar {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--fg-muted);
+}
+
+.provider-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--fg);
+}
+
+/* A peer in the same worktree is a fact about this session like the rest
+   of the byline, so it wears the same chip — the icon is what separates a
+   relationship from a plain label. */
+.session-kind {
+  align-items: center;
+  gap: 5px;
+}
+
+.session-kind svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+
+.card-content {
+  min-width: 0;
+}
+
+.card-byline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-height: 19px;
+}
+
+/* The countdown reads as a chip like the rest of the byline; its title
+   carries the wall-clock deadline and the timebox behind it. */
+.expiry-chip {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The emoji labels the task rather than opening the sentence, so it gets
+   its own column and wrapped lines align under the text, not the glyph. */
+.summary,
+.activity-summary,
+.task-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin: 0;
+}
+
+.summary-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-emoji {
+  flex: none;
+  width: 19px;
+  font-size: 17px;
+  line-height: inherit;
+  text-align: center;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 12px;
+  margin: 6px 2px 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.meta .path {
+  overflow-wrap: anywhere;
+}
+
+/* Red is reserved for a scope another agent is actually blocked on.
+   Uncommitted work and exclusive claims are the normal shape of a busy
+   worktree, so they read as emphasis, not as an alarm. */
+.dirty[data-state="dirty"] {
+  color: var(--fg);
+}
+
+/* A lease outlives the agent that took it: a crashed session keeps its
+   claims until expiry. A check-in gap past half the declared timebox is
+   the cheapest doubt signal there is — amber, because it is a doubt and
+   not a conflict. */
+.meta .stale {
+  color: var(--warning);
+}
+
+/* Testing is a normal phase of a healthy session, so it reads as plain
+   emphasis against the muted meta line rather than as a colour alert. */
+.agent-state {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.status[data-status="partial"] {
+  color: var(--warning);
+}
+
+.status[data-status="blocked"] {
+  color: var(--alert);
+}
+
+.activity-call {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding-top: 18px;
+}
+
+.activity-call + .activity-call {
+  margin-top: 14px;
+}
+
+.card-avatar .provider-icon,
+.activity-avatar .provider-icon {
+  width: 17px;
+  height: 17px;
+}
+
+/* A completion is one small green check and nothing else: the ring, the
+   bubble, and the context line stay neutral so finished work never
+   outshouts the agents that are still running. */
+.completion-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: var(--live);
+}
+
+/* Past work is denser than live traffic: one session's finished tasks all
+   share an identity, so the repeated agent, session, and repository move
+   up into a group head and each task keeps one scannable row. Indented to
+   the cards' content column (32px avatar + 12px gap) and muted, so a
+   project's recent work reads as a quiet appendix to the live cards
+   rather than more active traffic. */
+.task-group {
+  padding-top: 18px;
+  margin-left: 44px;
+  color: var(--fg-muted);
+}
+
+/* Separates a project's finished tasks from the live cards above them;
+   the label speaks once for every task group that follows it. */
+.recent-label {
+  margin: 22px 0 0 44px;
+  color: var(--fg-faint);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.recent-label + .task-group {
+  padding-top: 8px;
+}
+
+.task-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
+  min-width: 0;
+  padding-bottom: 5px;
+}
+
+.task-group-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.task-group-head .provider-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.task-group-where {
+  margin-left: auto;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.task-row {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 10px;
+  padding: 7px 0;
+}
+
+.task-icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  /* Baseline-aligned rows otherwise leave the icon sitting above the text. */
+  transform: translateY(2px);
+  color: var(--fg-faint);
+}
+
+.task-row[data-outcome="released"] .task-icon {
+  color: var(--live);
+}
+
+.task-summary {
+  /* Task rows are a dense list, so their summaries stay at body size
+     while the live bubbles above them read one step larger. */
+  font-size: 13px;
+}
+
+.task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 2;
+  gap: 2px 8px;
+  margin-top: 1px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.task-time {
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.activity-message {
+  min-width: 0;
+}
+
+.activity-byline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 19px;
+}
+
+.activity-speaker {
+  font-weight: 600;
+}
+
+.activity-age {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* What the agent is actually doing is the reason to look at this page, so
+   the bubble runs one step larger than the protocol detail around it. */
+.speech-bubble {
+  margin-top: 5px;
+  padding: 11px 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: 3px 10px 10px;
+  background: var(--surface);
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.activity-context {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 7px 2px 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.activity-origin,
+.activity-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.activity-verb {
+  color: var(--fg);
+}
+
+.activity-status {
+  font-weight: 500;
+}
+
+.activity-status[data-status="granted"] {
+  color: var(--live);
+}
+
+/* Released claims are the expected ending, not news: they read at the
+   same weight as the rest of the context line. */
+.activity-status[data-status="completed"] {
+  color: var(--fg-muted);
+}
+
+.activity-status[data-status="partial"] {
+  color: var(--warning);
+}
+
+.activity-status[data-status="blocked"] {
+  color: var(--alert);
+}
+
+.badges {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.badge {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 16px;
+  min-width: 0;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+
+.badge .mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.badge .access {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  color: var(--fg-faint);
+}
+
+.badge[data-access="exclusive"] {
+  color: var(--fg);
+}
+
+.badge[data-access="exclusive"] .access {
+  color: var(--warning);
+}
+
+details {
+  margin-top: 10px;
+}
+
+.agent-details {
+  margin: 7px 2px 0;
+}
+
+.agent-details summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  font-size: 12px;
+}
+
+.agent-details .exclusive-count {
+  color: var(--warning);
+}
+
+.detail-section {
+  margin-top: 10px;
+}
+
+.detail-label {
+  margin: 0 0 4px;
+  color: var(--fg-faint);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.detail-section .badges,
+.detail-section .paths {
+  margin-top: 0;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+  list-style: none;
+  width: fit-content;
+}
+
+summary::-webkit-details-marker {
+  display: none;
+}
+
+summary::before {
+  content: "+";
+  display: inline-block;
+  width: 16px;
+  color: var(--fg-faint);
+}
+
+details[open] summary::before {
+  content: "−";
+}
+
+summary:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.paths {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--fg-muted);
+}
+
+.paths li {
+  padding: 2px 0 2px 16px;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  margin: 0;
+  padding: 28px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+
+footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 44px;
+  color: var(--fg-faint);
+  font-size: 12px;
+}
+
+footer::after {
+  content: "Local state only";
+}
+
+footer[data-peers]::after {
+  content: "Tailnet view";
+}
+
+@media (max-width: 760px) {
+  .wrap {
+    padding: 24px 20px 44px;
+  }
+
+  .overview {
+    grid-template-columns: 1fr;
+    gap: 20px;
+    padding: 52px 0 30px;
+  }
+
+  h1 {
+    font-size: clamp(34px, 9vw, 48px);
+  }
+
+  .overview-copy {
+    max-width: 46ch;
+    margin: 0;
+  }
+
+  .overview-aside {
+    gap: 14px;
+  }
+
+  .group {
+    padding-top: 30px;
+  }
+
+  .card {
+    grid-template-columns: 30px minmax(0, 1fr);
+    gap: 10px;
+    padding: 13px 0 14px;
+  }
+
+  .card-avatar {
+    width: 30px;
+    height: 30px;
+  }
+
+  /* Track the narrower card column above. */
+  .recent-label,
+  .task-group {
+    margin-left: 40px;
+  }
+}
+
+@media (max-width: 480px) {
+  .wrap {
+    padding-inline: 16px;
+  }
+
+  /* Phone-width cards drop protocol detail — session ids, worktree
+     paths, and lease countdowns — so identity and summary stay
+     scannable. "updated Xm ago" remains as the single timestamp;
+     everything hidden here is still available on wider screens. */
+  .session-chip,
+  .expiry-chip,
+  .meta .path {
+    display: none;
+  }
+
+  /* At phone width the indent costs more than the alignment buys. */
+  .recent-label,
+  .task-group {
+    margin-left: 0;
+  }
+
+  h1 {
+    font-size: clamp(28px, 8.5vw, 44px);
+  }
+
+  .overview {
+    padding: 40px 0 26px;
+  }
+
+  .masthead,
+  .identity {
+    align-items: flex-start;
+  }
+
+  .identity {
+    flex-wrap: wrap;
+  }
+
+  .view-tabs {
+    flex-basis: 100%;
+    margin: 2px 0 0;
+    padding: 8px 0 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .live {
+    align-items: baseline;
+    white-space: normal;
+    text-align: right;
+  }
+
+  .group-head {
+    align-items: baseline;
+  }
+
+  .activity-call {
+    grid-template-columns: 30px minmax(0, 1fr);
+    gap: 9px;
+  }
+
+  .activity-avatar {
+    width: 30px;
+    height: 30px;
+  }
+
+  .activity-byline {
+    gap: 6px;
+  }
+
+  .speech-bubble {
+    margin-top: 3px;
+    padding: 9px 12px 10px;
+  }
+
+  .task-group-where {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+
+  .badge {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  footer::after {
+    display: none;
+  }
+}
