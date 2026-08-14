@@ -14,35 +14,16 @@ The metaphor is aviation radio. Agents self-announce position and intent while l
 
 ## Quick install prompt
 
-Hand this to any coding agent and it will set everything up:
+Hand this to any coding agent:
 
 ```text
-Set up Agent Frequency (https://github.com/linuz90/agent-frequency) on this machine.
-
-1. Check that Bun 1.3.14+ is installed; if it is missing, stop and ask me first.
-   Clone the repo to a stable, permanent path such as ~/Code/agent-frequency —
-   it gets baked into the client config and the login service, so moving it
-   later breaks both. cd into it.
-2. Run ./bin/agent-frequency-install. It installs dependencies and registers the
-   MCP server with whichever of Codex and Claude Code are present. Confirm with
-   ./bin/agent-frequency-install --check.
-3. macOS only: keep the monitor running at login. First check that nothing is
-   already listening on port 7893. Then write a LaunchAgent at
-   ~/Library/LaunchAgents/com.agent-frequency.monitor.plist running
-   <checkout>/bin/agent-frequency-monitor, with RunAtLoad and KeepAlive enabled,
-   WorkingDirectory set to the checkout, StandardOutPath and StandardErrorPath
-   set so failures are visible, and EnvironmentVariables setting HOME plus a
-   PATH containing the real bun directory — resolve it with
-   readlink -f "$(command -v bun)", since launchd's default PATH omits Bun and
-   the service then fails silently. Check it with plutil -lint, then start it
-   with launchctl bootstrap gui/$(id -u) <plist path>. On Linux, use an
-   equivalent user systemd unit instead.
-4. Wait a few seconds, then confirm http://127.0.0.1:7893 serves the monitor and
-   that the process serving it is the one launchd started. Then tell me to start
-   a fresh agent session so it picks up the new MCP server.
+Set up https://github.com/linuz90/agent-frequency on this machine by following its
+README: clone it somewhere permanent, run ./bin/agent-frequency-install, and add the
+login service from the "Keeping it running" section. Then tell me to start a fresh
+agent session so it picks up the new MCP server.
 ```
 
-Prefer to do it yourself? See [Install](#install) for the same steps by hand.
+Prefer to do it yourself? See [Install](#install).
 
 ## How it works
 
