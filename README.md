@@ -59,7 +59,9 @@ cd agent-frequency
 
 The installer pins dependencies and registers `bin/agent-frequency-mcp` globally with every client it finds, repairing registrations that point at an older checkout. Verify anytime with `./bin/agent-frequency-install --check`, then start a fresh client session so it loads the new server.
 
-MCP tools are model-controlled, so agents also need a standing instruction. Add something like this to your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or your client's equivalent):
+MCP tools are model-controlled, so a tool description alone cannot tell an agent *when* to call one. Agent Frequency ships that standing directive in the MCP `instructions` field, which the spec defines as guidance a client may add to the model's system prompt. Claude Code and Codex both surface it, so in those clients there is nothing further to configure.
+
+If your client ignores `instructions` — some do — add the equivalent to your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or the client's equivalent):
 
 > Before editing in a Git repository, call Agent Frequency's `announce` tool with `state: "working"`, a concise summary, the current working directory, narrow expected scopes, and a fixed timebox. Respect blocked scopes. Re-announce with the returned `lease_id` when scope changes and before commit or push. After finishing, announce `state: "done"` with that `lease_id` to release the claims immediately.
 

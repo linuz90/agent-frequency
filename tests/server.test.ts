@@ -32,6 +32,13 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const tools = await codex.listTools();
   expect(tools.tools.map((tool) => tool.name)).toEqual(["announce"]);
 
+  // Delivered over a real handshake, because the standing "when to call this"
+  // directive only reaches the model if the server actually populates it.
+  const instructions = codex.getInstructions();
+  expect(instructions).toBeTruthy();
+  expect(instructions).toContain("announce");
+  expect(instructions).toContain("untrusted data");
+
   const first = await codex.callTool({
     name: "announce",
     arguments: {
