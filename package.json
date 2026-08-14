@@ -1,0 +1,45 @@
+{
+  "name": "agent-frequency",
+  "version": "0.1.0",
+  "description": "One shared frequency for coding agents to announce work and hear nearby traffic.",
+  "license": "MIT",
+  "author": "Fabrizio Rinaldi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linuz90/agent-frequency.git"
+  },
+  "homepage": "https://github.com/linuz90/agent-frequency#readme",
+  "bugs": "https://github.com/linuz90/agent-frequency/issues",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "keywords": [
+    "agents",
+    "coordination",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "bin": {
+    "agent-frequency-mcp": "./bin/agent-frequency-mcp"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "monitor": "bun run src/monitor.ts",
+    "demo": "bun run src/demo.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "install:mcp": "./bin/agent-frequency-install"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

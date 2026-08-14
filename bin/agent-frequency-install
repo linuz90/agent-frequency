@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVER="$REPO_DIR/bin/agent-frequency-mcp"
+MODE="${1:-install}"
+
+if [ "$MODE" != "install" ] && [ "$MODE" != "--check" ]; then
+  printf 'Usage: %s [--check]\n' "$0" >&2
+  exit 2
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+  printf 'Agent Frequency requires Bun 1.3.14 or newer.\n' >&2
+  exit 1
+fi
+
+if [ "$MODE" = "install" ]; then
+  (cd "$REPO_DIR" && bun install --frozen-lockfile)
+fi
+
+configured=0
+status=0
+
+if [ "$MODE" = "--check" ] && {
+  [ ! -d "$REPO_DIR/node_modules/@modelcontextprotocol/sdk" ] \
+    || [ ! -d "$REPO_DIR/node_modules/zod" ];
+}; then
+  printf 'Agent Frequency: dependencies are missing; run %s.\n' "$0" >&2
+  status=1
+fi
+
+configure_codex() {
+  local current
+  command -v codex >/dev/null 2>&1 || return 0
+  configured=1
+  current="$(codex mcp get agent-frequency 2>/dev/null || true)"
+  if printf '%s\n' "$current" | grep -Fq "command: $SERVER" \
+    && printf '%s\n' "$current" | grep -Fq "env: AGENT_FREQUENCY_CLIENT_NAME="; then
+    printf 'Agent Frequency: Codex registration is current.\n'
+    return 0
+  fi
+  if [ "$MODE" = "--check" ]; then
+    printf 'Agent Frequency: Codex registration is missing or stale.\n' >&2
+    return 1
+  fi
+  [ -z "$current" ] || codex mcp remove agent-frequency >/dev/null 2>&1
+  codex mcp add --env AGENT_FREQUENCY_CLIENT_NAME=Codex agent-frequency -- "$SERVER" >/dev/null
+  printf 'Agent Frequency: registered for Codex.\n'
+}
+
+configure_claude() {
+  local current
+  command -v claude >/dev/null 2>&1 || return 0
+  configured=1
+  current="$(claude mcp get agent-frequency 2>/dev/null || true)"
+  if printf '%s\n' "$current" | grep -Fq "Command: $SERVER" \
+    && printf '%s\n' "$current" | grep -Fq "AGENT_FREQUENCY_CLIENT_NAME=Claude"; then
+    printf 'Agent Frequency: Claude registration is current.\n'
+    return 0
+  fi
+  if [ "$MODE" = "--check" ]; then
+    printf 'Agent Frequency: Claude registration is missing or stale.\n' >&2
+    return 1
+  fi
+  [ -z "$current" ] || claude mcp remove agent-frequency -s user >/dev/null 2>&1
+  claude mcp add --scope user agent-frequency -e AGENT_FREQUENCY_CLIENT_NAME=Claude -- "$SERVER" >/dev/null
+  printf 'Agent Frequency: registered for Claude.\n'
+}
+
+configure_codex || status=1
+configure_claude || status=1
+
+if [ "$configured" = "0" ]; then
+  printf 'Agent Frequency installed, but neither Codex nor Claude is available to register.\n'
+fi
+
+exit "$status"
