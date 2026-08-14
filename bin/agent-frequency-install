@@ -5,10 +5,78 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVER="$REPO_DIR/bin/agent-frequency-mcp"
-MODE="${1:-install}"
+MONITOR="$REPO_DIR/bin/agent-frequency-monitor"
+SERVICE_LABEL="com.agent-frequency.monitor"
+SERVICE_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+MONITOR_PORT="${AGENT_FREQUENCY_MONITOR_PORT:-7893}"
+MONITOR_PEERS="${AGENT_FREQUENCY_MONITOR_PEERS:-}"
 
-if [ "$MODE" != "install" ] && [ "$MODE" != "--check" ]; then
-  printf 'Usage: %s [--check]\n' "$0" >&2
+MODE="install"
+WITH_MAC_SERVICE=0
+PEER_REQUESTED=0
+
+usage() {
+  printf 'Usage: %s [--check] [--with-mac-service] [--peer URL]...\n' "$0"
+}
+
+# Peer URLs are written verbatim into the service plist, so anything that could
+# terminate the XML string or smuggle another key is rejected rather than
+# escaped. The monitor validates them again at startup.
+add_peer() {
+  case "$1" in
+    http://* | https://*) ;;
+    *)
+      printf 'Agent Frequency: monitor peers must be http(s) URLs: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+  case "$1" in
+    *[\<\>\&\"\'\ ]*)
+      printf 'Agent Frequency: invalid character in monitor peer URL: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+  # The first --peer replaces any inherited environment value so the flags
+  # alone describe the resulting service; later ones append.
+  if [ "$PEER_REQUESTED" = "0" ]; then
+    MONITOR_PEERS="$1"
+  else
+    MONITOR_PEERS="$MONITOR_PEERS,$1"
+  fi
+  PEER_REQUESTED=1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    install) MODE="install" ;;
+    --check) MODE="--check" ;;
+    --with-mac-service) WITH_MAC_SERVICE=1 ;;
+    --peer)
+      if [ "$#" -lt 2 ]; then
+        printf 'Agent Frequency: --peer needs a monitor URL.\n' >&2
+        exit 2
+      fi
+      add_peer "$2"
+      shift
+      ;;
+    --peer=*) add_peer "${1#--peer=}" ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# Peers only reach the monitor through the service plist or the environment, so
+# a lone --peer would otherwise look applied while changing nothing.
+if [ "$PEER_REQUESTED" = "1" ] && [ "$WITH_MAC_SERVICE" = "0" ] && [ "$MODE" != "--check" ]; then
+  printf 'Agent Frequency: --peer configures the login service; add --with-mac-service.\n' >&2
+  printf 'For a monitor you start yourself, pass --peer to bin/agent-frequency-monitor instead.\n' >&2
   exit 2
 fi
 
@@ -75,6 +143,141 @@ configure_claude || status=1
 
 if [ "$configured" = "0" ]; then
   printf 'Agent Frequency installed, but neither Codex nor Claude is available to register.\n'
+fi
+
+service_loaded() {
+  launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1
+}
+
+listening_pid() {
+  lsof -ti tcp:"$MONITOR_PORT" -sTCP:LISTEN 2>/dev/null | head -1
+}
+
+# launchd starts with a minimal PATH that omits Bun, so the plist has to carry
+# one. Prefer the directory holding the `bun` on PATH: for Homebrew that is the
+# stable /opt/homebrew/bin symlink, whereas the fully resolved path points into
+# a version-pinned Cellar directory that disappears on the next upgrade. The
+# resolved directory is still appended, because version-manager shims resolve
+# to a real binary that the shim directory alone may not expose to launchd.
+service_path_value() {
+  local bun direct resolved entry
+  bun="$(command -v bun)"
+  direct="$(cd "$(dirname "$bun")" && pwd)"
+  resolved="$(readlink -f "$bun" 2>/dev/null || printf '%s' "$bun")"
+  resolved="$(cd "$(dirname "$resolved")" && pwd)"
+  local value="$direct"
+  for entry in "$resolved" /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
+    case ":$value:" in
+      *":$entry:"*) ;;
+      *) value="$value:$entry" ;;
+    esac
+  done
+  printf '%s' "$value"
+}
+
+write_service_plist() {
+  local peers_entry=""
+  if [ -n "$MONITOR_PEERS" ]; then
+    peers_entry="$(printf '\n    <key>AGENT_FREQUENCY_MONITOR_PEERS</key><string>%s</string>' \
+      "$MONITOR_PEERS")"
+  fi
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  cat >"$SERVICE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SERVICE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$MONITOR</string></array>
+  <key>WorkingDirectory</key><string>$REPO_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/agent-frequency-monitor.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/agent-frequency-monitor.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$(service_path_value)</string>
+    <!-- Pinned so the service binds the same port this installer checked for a
+         conflict, rather than falling back to the default under launchd. -->
+    <key>AGENT_FREQUENCY_MONITOR_PORT</key><string>$MONITOR_PORT</string>$peers_entry
+  </dict>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$SERVICE_PLIST" >/dev/null
+}
+
+check_mac_service() {
+  local peers
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  if [ ! -f "$SERVICE_PLIST" ]; then
+    printf 'Agent Frequency: login service is not installed.\n'
+    return 0
+  fi
+  peers="$(plutil -extract EnvironmentVariables.AGENT_FREQUENCY_MONITOR_PEERS raw -o - \
+    "$SERVICE_PLIST" 2>/dev/null || true)"
+  if [ -n "$peers" ]; then
+    printf 'Agent Frequency: login service aggregates monitor peers: %s\n' "$peers"
+  fi
+  if service_loaded; then
+    printf 'Agent Frequency: login service is installed and loaded.\n'
+  else
+    printf 'Agent Frequency: login service is installed but not loaded.\n' >&2
+    return 1
+  fi
+}
+
+configure_mac_service() {
+  local existing
+  if [ "$(uname -s)" != "Darwin" ]; then
+    printf '%s only supports macOS. On Linux, use a user systemd unit; see the README.\n' \
+      "--with-mac-service" >&2
+    return 1
+  fi
+
+  # A foreign listener means a second monitor would crash-loop under KeepAlive
+  # while the stale one keeps answering, which reads as a healthy install.
+  existing="$(listening_pid)"
+  if [ -n "$existing" ] && ! service_loaded; then
+    printf 'Agent Frequency: port %s is already served by PID %s, which this service does not manage.\n' \
+      "$MONITOR_PORT" "$existing" >&2
+    printf 'Stop it first, or set AGENT_FREQUENCY_MONITOR_PORT to a free port.\n' >&2
+    return 1
+  fi
+
+  write_service_plist
+  # Written as an if rather than `service_loaded && ...`, because under `set -e`
+  # a false left side would make the whole list fail and abort the installer.
+  if service_loaded; then
+    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 || true
+  fi
+  if ! launchctl bootstrap "gui/$(id -u)" "$SERVICE_PLIST"; then
+    printf 'Agent Frequency: launchctl could not load %s.\n' "$SERVICE_PLIST" >&2
+    return 1
+  fi
+
+  local waited=0
+  while [ "$waited" -lt 10 ]; do
+    if [ -n "$(listening_pid)" ]; then
+      printf 'Agent Frequency: monitor running at http://127.0.0.1:%s (starts at login).\n' "$MONITOR_PORT"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  printf 'Agent Frequency: login service loaded but nothing is listening on port %s yet.\n' "$MONITOR_PORT" >&2
+  printf 'Check ~/Library/Logs/agent-frequency-monitor.err.\n' >&2
+  return 1
+}
+
+if [ "$MODE" = "--check" ]; then
+  check_mac_service || status=1
+elif [ "$WITH_MAC_SERVICE" = "1" ]; then
+  configure_mac_service || status=1
 fi
 
 exit "$status"
