@@ -320,15 +320,12 @@ h1 {
 
 /* The section's last card needs no closing rule: the recent block below it
    opens with its own label, and the next project opens with its own head, so
-   a full-width divider there only adds noise next to the indented content. */
-.group .card:last-of-type {
-  border-bottom: 0;
-}
-
-/* A worktree is a container inside a project, so its cards sit under one
-   quiet head rather than repeating the branch and path on every row. The
-   rule above still has to reach the last card of the last worktree. */
-.worktree-group:last-of-type .card:last-of-type {
+   a full-width divider there only adds noise next to the indented content.
+   Direct-child selectors keep an earlier identity cluster's last session
+   divided from the next agent. */
+.group > .card:last-of-type,
+.worktree-group:last-of-type > .card:last-child,
+.worktree-group:last-of-type > .agent-cluster:last-child > .card:last-child {
   border-bottom: 0;
 }
 
@@ -378,6 +375,39 @@ h1 {
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
+}
+
+/* Sessions from the same agent, app, machine, and worktree share one identity
+   line. The sessions stay separate below it, retaining independent state,
+   timestamps, scopes, and blockers without repeating the visual byline. */
+.agent-cluster {
+  min-width: 0;
+}
+
+.agent-cluster-head {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0 1px;
+}
+
+.agent-cluster-count,
+.task-group-count {
+  color: var(--fg-faint);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.agent-cluster-card {
+  display: block;
+  margin-left: 44px;
+  padding: 7px 0 12px;
+}
+
+.agent-cluster-card .card-byline {
+  min-height: 0;
 }
 
 .agent-label {
@@ -609,11 +639,10 @@ h1 {
   color: var(--warning);
 }
 
-/* Past work is denser than live traffic: one session's finished tasks all
-   share an identity, so the repeated agent, session, and repository move
-   up into a group head and each task keeps one scannable row. Indented to
-   the cards' content column (32px avatar + 12px gap) and muted, so a
-   project's recent work reads as a quiet appendix to the live cards
+/* Past work is denser than live traffic: adjacent tasks from one displayed
+   identity share a head, while distinct session ids remain on their rows.
+   Indented to the cards' content column (32px avatar + 12px gap) and muted,
+   so a project's recent work reads as a quiet appendix to the live cards
    rather than more active traffic. */
 .task-group {
   padding-top: 18px;
@@ -990,6 +1019,15 @@ footer[data-peers]::after {
     height: 30px;
   }
 
+  .agent-cluster-head {
+    grid-template-columns: 30px minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .agent-cluster-card {
+    margin-left: 40px;
+  }
+
   /* Track the narrower card column above; the label keeps the marker's
      16px inside that indent. */
   .task-group {
@@ -1014,6 +1052,13 @@ footer[data-peers]::after {
   .expiry-chip,
   .meta .path {
     display: none;
+  }
+
+  /* A clustered card no longer repeats the full identity, so its compact
+     session id remains visible on phones to associate state and claims with
+     the right live process. */
+  .agent-cluster-card .session-chip {
+    display: inline-flex;
   }
 
   /* At phone width the indent costs more than the alignment buys. */

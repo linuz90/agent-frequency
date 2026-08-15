@@ -371,16 +371,33 @@
     return chip;
   }
 
-  // Identity is the agent, where it runs, which session it is, and whether
-  // it shares this worktree — the last three as quiet chips, so the name
-  // and the summary own the top of the card.
+  function identityKey(agentLabel, agentId, clientSurface, machine) {
+    return JSON.stringify([
+      (agentLabel || agentId || "Agent").toLowerCase(),
+      clientSurface || "unknown",
+      machine || "",
+    ]);
+  }
+
+  function identityDescription(agentLabel, agentId, clientSurface, machine) {
+    var parts = [agentLabel || agentId || "Agent"];
+    var app = surfaceLabel(clientSurface);
+    if (app) parts.push(app);
+    if (machine) parts.push(machine);
+    if (agentId) parts.push("session " + agentId);
+    return parts.join(", ");
+  }
+
+  // Identity is the agent and where it runs. A standalone card also names its
+  // session; a shared identity head leaves that detail to the compact cards it
+  // introduces so the same Codex / T3 Code line is not repeated down the page.
   function renderAgentIdentity(agentLabel, agentId, clientSurface, sameWorktree, machine) {
     var label = agentLabel || agentId || "Agent";
     var name = el("div", "agent-name");
     name.appendChild(el("span", "agent-label", label));
     var chip = originChip(clientSurface, machine);
     if (chip) name.appendChild(chip);
-    name.appendChild(sessionChip(agentId, label));
+    if (agentId) name.appendChild(sessionChip(agentId, label));
     if (sameWorktree) {
       var kind = el("span", "chip session-kind", "same worktree");
       kind.prepend(forkIcon());
@@ -604,24 +621,29 @@
     });
   }
 
-  // One session working in one worktree produces most of its tasks in a
-  // row, so grouping by session keeps the agent, machine, and repository
-  // out of every single row and leaves the summaries scannable.
-  function groupTasksBySession(tasks) {
-    var order = [];
-    var groups = new Map();
+  // Several Codex or Claude sessions often finish together. Their session ids
+  // still distinguish the rows, but agent, app, and machine are one shared
+  // identity and only need saying once.
+  function groupTasksByIdentity(tasks) {
+    var groups = [];
     tasks.forEach(function (task) {
-      var key = taskKey(task.machine, task.agent_id, task.worktree_root);
-      if (!groups.has(key)) {
-        groups.set(key, []);
-        order.push(key);
+      var key = identityKey(
+        task.agent_label,
+        task.agent_id,
+        task.client_surface,
+        task.machine
+      );
+      var group = groups[groups.length - 1];
+      if (!group || group.key !== key) {
+        group = { key: key, tasks: [] };
+        groups.push(group);
       }
-      groups.get(key).push(task);
+      group.tasks.push(task);
     });
-    // Tasks arrive newest first, so first appearance already orders the
-    // sessions by their most recent work.
-    return order.map(function (key) {
-      return groups.get(key);
+    // Only adjacent tasks collapse; an intervening identity remains meaningful
+    // chronology rather than being reordered for presentation.
+    return groups.map(function (group) {
+      return group.tasks;
     });
   }
 
@@ -668,10 +690,15 @@
     );
     var showWorktree = roots.size > 1;
 
-    groupTasksBySession(tasks).forEach(function (sessionTasks) {
-      var newest = sessionTasks[0];
+    groupTasksByIdentity(tasks).forEach(function (identityTasks) {
+      var newest = identityTasks[0];
       var label = newest.agent_label || newest.agent_id;
       var group = el("section", "task-group");
+      var sessions = new Set(
+        identityTasks.map(function (task) {
+          return task.agent_id;
+        })
+      );
 
       var groupHead = el("div", "task-group-head");
       var agent = el("span", "task-group-agent");
@@ -680,21 +707,32 @@
       groupHead.appendChild(agent);
       var origin = originChip(newest.client_surface, newest.machine);
       if (origin) groupHead.appendChild(origin);
-      groupHead.appendChild(sessionChip(newest.agent_id, label));
-      // The repository is already the section this group sits in, so the
-      // head carries only what still varies inside it.
-      var where = newest.branch || "";
-      if (showWorktree && newest.worktree_root) {
-        where = where ? where + " · " + pathTail(newest.worktree_root) : pathTail(newest.worktree_root);
+      if (sessions.size === 1) {
+        groupHead.appendChild(sessionChip(newest.agent_id, label));
+      } else {
+        groupHead.appendChild(el("span", "task-group-count", sessions.size + " sessions"));
       }
-      if (where) {
-        var whereEl = el("span", "task-group-where mono", where);
+      // The repository is already the section this group sits in, so the
+      // head carries only context shared by every row beneath it.
+      function taskWhere(task) {
+        var where = task.branch || "";
+        if (showWorktree && task.worktree_root) {
+          where = where
+            ? where + " · " + pathTail(task.worktree_root)
+            : pathTail(task.worktree_root);
+        }
+        return where;
+      }
+      var locations = new Set(identityTasks.map(taskWhere));
+      var sharedWhere = locations.size === 1 ? taskWhere(newest) : "";
+      if (sharedWhere) {
+        var whereEl = el("span", "task-group-where mono", sharedWhere);
         if (newest.worktree_root) whereEl.title = newest.worktree_root;
         groupHead.appendChild(whereEl);
       }
       group.appendChild(groupHead);
 
-      sessionTasks.forEach(function (task) {
+      identityTasks.forEach(function (task) {
         var row = el("div", "task-row");
         row.setAttribute("data-outcome", task.outcome);
         row.appendChild(
@@ -709,9 +747,9 @@
         trackTime(timestamp, "event", task.ended_at_ms);
         row.appendChild(timestamp);
 
-        // Every call a task made is one tab away in Activity, so a row
-        // carries only what sets it apart: how it ended, how long it ran,
-        // and a branch that differs from the rest of the session.
+        // Every call a task made is one tab away in Activity, so a row carries
+        // only what sets it apart: how it ended, its session when the shared
+        // identity has several, how long it ran, and any differing location.
         var meta = el("div", "task-meta");
         if (task.outcome === "expired") meta.appendChild(el("span", null, "lease ran out"));
         if (task.outcome === "stopped") {
@@ -719,12 +757,18 @@
             el("span", "task-reason", "stopped: " + (task.reason || "unfinished"))
           );
         }
+        if (sessions.size > 1) {
+          meta.appendChild(sessionChip(task.agent_id, task.agent_label || task.agent_id));
+        }
         // Only the calls still inside the seven-day window are visible, so
         // a task that started before it reads as shorter than it ran.
         var span = task.ended_at_ms - task.started_at_ms;
         if (span >= 60000) meta.appendChild(el("span", null, "ran " + formatDuration(span)));
-        if (task.branch && task.branch !== newest.branch) {
-          meta.appendChild(el("span", "mono", task.branch));
+        var where = taskWhere(task);
+        if (!sharedWhere && where) {
+          var rowWhere = el("span", "mono", where);
+          if (task.worktree_root) rowWhere.title = task.worktree_root;
+          meta.appendChild(rowWhere);
         }
         if (meta.childNodes.length > 0) row.appendChild(meta);
 
@@ -783,6 +827,31 @@
     return order.map(function (key) {
       return groups.get(key);
     });
+  }
+
+  // Live leases are freshness-sorted, so matching sessions can have another
+  // agent between them. Coalesce the whole worktree while retaining the first
+  // identity appearance and each identity's original session order.
+  function groupEntriesByIdentity(entries) {
+    var groups = [];
+    var groupsByKey = new Map();
+    entries.forEach(function (entry) {
+      var lease = entry.lease;
+      var key = identityKey(
+        lease.agent_label,
+        lease.agent_id,
+        lease.client_surface,
+        entry.machine
+      );
+      var group = groupsByKey.get(key);
+      if (!group) {
+        group = { key: key, entries: [] };
+        groupsByKey.set(key, group);
+        groups.push(group);
+      }
+      group.entries.push(entry);
+    });
+    return groups;
   }
 
   // The tier earns its place by distinguishing (the project spans several
@@ -927,15 +996,17 @@
 
   function sessionClusterKey(entry) {
     if (!entry.lease.worktree_root) return null;
-    // The same absolute path on two machines is two different worktrees,
-    // so the machine label is part of the key.
-    return (
-      (entry.machine || "") +
-      "\u0000" +
-      (entry.lease.agent_label || entry.lease.agent_id || "Agent").toLowerCase() +
-      "\u0000" +
-      entry.lease.worktree_root
-    );
+    // Session relationships only collapse inside one complete display
+    // identity: same label, app, machine, and physical checkout.
+    return JSON.stringify([
+      identityKey(
+        entry.lease.agent_label,
+        entry.lease.agent_id,
+        entry.lease.client_surface,
+        entry.machine
+      ),
+      entry.lease.worktree_root,
+    ]);
   }
 
   function countSessionClusters(entries) {
@@ -945,6 +1016,30 @@
       if (key) counts.set(key, (counts.get(key) || 0) + 1);
     });
     return counts;
+  }
+
+  /** One shared identity line for sessions coalesced inside a worktree. */
+  function renderAgentClusterHead(entry, sessionCount) {
+    var lease = entry.lease;
+    var label = lease.agent_label || lease.agent_id || "Agent";
+    var head = el("div", "agent-cluster-head");
+    var avatar = el("div", "card-avatar");
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.appendChild(providerIcon(label, lease.agent_id));
+    head.appendChild(avatar);
+
+    var identity = renderAgentIdentity(
+      lease.agent_label,
+      null,
+      lease.client_surface,
+      false,
+      entry.machine
+    );
+    identity.appendChild(
+      el("span", "agent-cluster-count", sessionCount + " sessions")
+    );
+    head.appendChild(identity);
+    return head;
   }
 
   /**
@@ -991,10 +1086,11 @@
    * carries its branch, path, and any shared-checkout warning, so the card
    * drops those rather than repeating them on every row.
    */
-  function renderCard(entry, sameWorktree, latestEvent, grouped) {
+  function renderCard(entry, sameWorktree, latestEvent, grouped, sharedIdentity) {
     var lease = entry.lease;
     var homeDir = entry.homeDir;
-    var card = el("article", "card");
+    var cardClass = sharedIdentity ? "card agent-cluster-card" : "card";
+    var card = el("article", cardClass);
     var testing = lease.agent_state === "testing";
     var planning = lease.agent_state === "planning";
     // Neither advisory state holds a lock, so both drop the language of
@@ -1002,22 +1098,36 @@
     var advisory = testing || planning;
     card.setAttribute("data-state", advisory ? lease.agent_state : "working");
     var label = lease.agent_label || lease.agent_id || "Agent";
-    var avatar = el("div", "card-avatar");
-    avatar.setAttribute("aria-hidden", "true");
-    avatar.appendChild(providerIcon(label, lease.agent_id));
-    card.appendChild(avatar);
+    // The visible identity lives once on the cluster head; name each article
+    // as well so article navigation retains the agent/app/machine context.
+    if (sharedIdentity) {
+      card.setAttribute(
+        "aria-label",
+        identityDescription(label, lease.agent_id, lease.client_surface, entry.machine)
+      );
+    }
+    if (!sharedIdentity) {
+      var avatar = el("div", "card-avatar");
+      avatar.setAttribute("aria-hidden", "true");
+      avatar.appendChild(providerIcon(label, lease.agent_id));
+      card.appendChild(avatar);
+    }
 
     var content = el("div", "card-content");
     var byline = el("div", "card-byline");
-    byline.appendChild(
-      renderAgentIdentity(
-        lease.agent_label,
-        lease.agent_id,
-        lease.client_surface,
-        sameWorktree && !grouped,
-        entry.machine
-      )
-    );
+    if (sharedIdentity) {
+      byline.appendChild(sessionChip(lease.agent_id, label));
+    } else {
+      byline.appendChild(
+        renderAgentIdentity(
+          lease.agent_label,
+          lease.agent_id,
+          lease.client_surface,
+          sameWorktree && !grouped,
+          entry.machine
+        )
+      );
+    }
     var expiry = el("span", "chip expiry-chip");
     expiry.title = expiryTitle(lease);
     trackTime(expiry, "expiry", lease.expires_at_ms);
@@ -1278,18 +1388,30 @@
             );
             section.appendChild(host);
           }
-          worktree.entries.forEach(function (entry) {
-            var clusterKey = sessionClusterKey(entry);
-            host.appendChild(
-              renderCard(
-                entry,
-                clusterKey !== null && (sessionClusters.get(clusterKey) || 0) > 1,
-                latestEvents.get(
-                  taskKey(entry.machine, entry.lease.agent_id, entry.lease.worktree_root)
-                ),
-                tiered
-              )
-            );
+          groupEntriesByIdentity(worktree.entries).forEach(function (identityGroup) {
+            var sharedIdentity = identityGroup.entries.length > 1;
+            var cardHost = host;
+            if (sharedIdentity) {
+              cardHost = el("div", "agent-cluster");
+              cardHost.appendChild(
+                renderAgentClusterHead(identityGroup.entries[0], identityGroup.entries.length)
+              );
+              host.appendChild(cardHost);
+            }
+            identityGroup.entries.forEach(function (entry) {
+              var clusterKey = sessionClusterKey(entry);
+              cardHost.appendChild(
+                renderCard(
+                  entry,
+                  clusterKey !== null && (sessionClusters.get(clusterKey) || 0) > 1,
+                  latestEvents.get(
+                    taskKey(entry.machine, entry.lease.agent_id, entry.lease.worktree_root)
+                  ),
+                  tiered,
+                  sharedIdentity
+                )
+              );
+            });
           });
         });
         if (recent.length > 0) {

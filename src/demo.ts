@@ -158,6 +158,8 @@ const WORKTREES: Record<string, DemoWorktree> = {
 
 const AGENTS: Record<string, DemoAgent> = {
   ada: { label: "Claude", surface: "t3-code", worktree: "acme-web" },
+  ivy: { label: "Claude", surface: "t3-code", worktree: "acme-web" },
+  jo: { label: "Claude", surface: "t3-code", worktree: "acme-web" },
   bo: { label: "Codex", surface: "codex-app", worktree: "acme-web" },
   cyd: { label: "Claude", surface: "claude-app", worktree: "acme-web-billing" },
   dex: { label: "Codex", surface: "cli", worktree: "acme-api" },
@@ -230,6 +232,22 @@ const TIMELINE: DemoAnnouncement[] = [
       { path: "src/billing", access: "exclusive" },
     ],
     timebox: "2h",
+  },
+  {
+    agent: "ivy",
+    minutesAgo: 24,
+    summary: "Trace invoice total edge cases in the billing tests",
+    emoji: "🔎",
+    scopes: [{ path: "tests/billing", access: "shared" }],
+    timebox: "1h",
+  },
+  {
+    agent: "jo",
+    minutesAgo: 23,
+    summary: "Check checkout component call sites",
+    emoji: "🧭",
+    scopes: [{ path: "src/components", access: "shared" }],
+    timebox: "1h",
   },
   // Same worktree as ada, and asks for the same exclusive path: one scope is
   // granted and one is blocked, so the feed carries a `partial` announcement.

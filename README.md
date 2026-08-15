@@ -8,7 +8,7 @@ Agent Frequency gives every agent one lightweight operation: announce what you i
 
 The metaphor is aviation radio. Agents self-announce position and intent while listening for nearby traffic, with no control tower in the middle. The product is **presence and collision awareness, not task management**.
 
-![The Agent Frequency monitor, showing six agents working across four repositories](docs/monitor.png)
+![The Agent Frequency monitor, showing eight agents working across four repositories](docs/monitor.png)
 
 <p align="center"><em>The optional read-only <a href="#monitor">monitor</a>, showing live traffic across four repositories.</em></p>
 
@@ -138,13 +138,13 @@ One timing limitation is fundamental: of two simultaneous callers, the later one
 
 `./bin/agent-frequency-monitor` serves a live view of the frequency at `http://127.0.0.1:7893` — the page [shown above](#agent-frequency). Pass `--port` to move it.
 
-The **Agents** view groups everything by repository: active leases with summaries, branches, claims, dirty paths, and lease countdowns — a card whose last call came back blocked says who it is waiting on — followed by that project's **recent work** — the last few finished tasks from the past day, rolled up per session, so a quiet frequency still shows what just wrapped up in place; a task ends with a green check (done), an amber octagon and the agent's reason (stopped unfinished), or a quiet clock (lease ran out). The **Activity** view shows recent announcements, check-ins, completions, and stops, naming the blocking agent on blocked calls. Both refresh every few seconds, filter down to a single project or machine once several are in view, and reload open tabs when the UI itself changes.
+The **Agents** view groups everything by repository: active leases with summaries, branches, claims, dirty paths, and lease countdowns — a card whose last call came back blocked says who it is waiting on — followed by that project's **recent work** — the last few finished tasks from the past day, grouped by agent identity with distinct sessions still named, so a quiet frequency still shows what just wrapped up in place; a task ends with a green check (done), an amber octagon and the agent's reason (stopped unfinished), or a quiet clock (lease ran out). Independently identified sessions from the same agent, app, machine, and worktree share one compact identity line while retaining separate cards, state, scopes, and completion. The monitor groups by identity only; helpers sharing one host-provided Agent Frequency identity remain one session. The **Activity** view shows recent announcements, check-ins, completions, and stops, naming the blocking agent on blocked calls. Both refresh every few seconds, filter down to a single project or machine once several are in view, and reload open tabs when the UI itself changes.
 
 Inside a project, cards cluster by worktree whenever that says something: the project spans several checkouts, or one checkout holds several agents. Each cluster leads with a quiet head naming the branch and path, and — the case this product exists for — how many agents are inside that one worktree at once, since those agents edit the same files and only their claimed scopes keep them apart. A single agent in a single checkout gets no such head.
 
-![One project filtered in the monitor: three agents across two worktrees, two of them sharing the main checkout while a third waits on a scope one of them claimed](docs/monitor-worktrees.png)
+![One project filtered in the monitor: five sessions across two worktrees, including three compact Claude sessions](docs/monitor-worktrees.png)
 
-<p align="center"><em>One project in view: two agents share <code>main</code>, and both the Codex session beside them and the agent in the <code>feat/billing</code> worktree are waiting on a scope the first one claimed.</em></p>
+<p align="center"><em>One project in view: three independent Claude sessions share one compact identity line on <code>main</code>, beside another agent, while a fifth works in the <code>feat/billing</code> worktree.</em></p>
 
 A card leads with the agent and its task emoji, then chips the host app, the machine, the session, and the lease it has left. A check-in gap past half the declared timebox turns the timestamp amber: a lease outlives the agent that took it, so a crashed session keeps claiming files until expiry, and silence is the first cheap sign of one. Red is kept for scopes an agent is actually blocked on.
 
@@ -226,7 +226,7 @@ On Linux, the equivalent is a user systemd unit with `Restart=always` and `Wante
 
 ### Demo traffic
 
-Designing against real traffic means waiting for other agents to happen to announce. `./bin/agent-frequency-demo` fills the gap with a fixed timeline: eight agents across four fake projects, every client surface, and granted, partial, blocked, renewed, completed, and listening-only announcements.
+Designing against real traffic means waiting for other agents to happen to announce. `./bin/agent-frequency-demo` fills the gap with a fixed timeline: ten independent sessions across four fake projects, including three same-agent sessions that exercise compact grouping, every client surface, and granted, partial, blocked, renewed, completed, and listening-only announcements.
 
 ```bash
 ./bin/agent-frequency-demo seed     # replace any existing demo traffic

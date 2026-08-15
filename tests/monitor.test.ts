@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 
 import { Database } from "bun:sqlite";
 
@@ -49,6 +50,82 @@ async function fetchState(monitor: MonitorHandle): Promise<MonitorState> {
   const response = await fetch(`${monitor.url}api/state`);
   expect(response.status).toBe(200);
   return (await response.json()) as MonitorState;
+}
+
+interface BrowserIdentityEntry {
+  lease: {
+    agent_id: string;
+    agent_label: string;
+    client_surface: string;
+  };
+  machine: string | null;
+}
+
+interface BrowserIdentityInternals {
+  groupEntriesByIdentity(entries: BrowserIdentityEntry[]): Array<{
+    entries: BrowserIdentityEntry[];
+  }>;
+}
+
+/** Executes the shipped browser bundle far enough to expose its pure grouping
+ * helpers. This tests the actual inline script without adding a DOM dependency
+ * or a production-only test hook. Refresh stays pending and timers are inert. */
+function browserIdentityInternals(): BrowserIdentityInternals {
+  const source = readFileSync(new URL("../src/monitor.js", import.meta.url), "utf8");
+  const marker = "  syncViewTabs();\n  refresh();";
+  if (!source.includes(marker)) throw new Error("monitor wiring marker not found");
+  const instrumented = source.replace(
+    marker,
+    `  globalThis.__agentFrequencyIdentityTest = {
+    groupEntriesByIdentity: groupEntriesByIdentity
+  };
+${marker}`,
+  );
+  const inertNode = {
+    addEventListener() {},
+    focus() {},
+    removeAttribute() {},
+    setAttribute() {},
+    parentElement: { addEventListener() {} },
+    textContent: "",
+    value: "",
+  };
+  const context: Record<string, unknown> = {
+    document: { getElementById: () => inertNode },
+    fetch: () => new Promise(() => {}),
+    setInterval: () => 0,
+    URL,
+    URLSearchParams,
+    window: {
+      history: { replaceState() {} },
+      location: { hash: "", href: "http://127.0.0.1/", pathname: "/", search: "" },
+      sessionStorage: { getItem: () => null, setItem() {} },
+    },
+  };
+  runInNewContext(instrumented, context);
+  return runInNewContext(
+    "globalThis.__agentFrequencyIdentityTest",
+    context,
+  ) as BrowserIdentityInternals;
+}
+
+function browserIdentityEntry(
+  agentId: string,
+  overrides: Partial<Omit<BrowserIdentityEntry, "lease">> & {
+    lease?: Partial<BrowserIdentityEntry["lease"]>;
+  } = {},
+): BrowserIdentityEntry {
+  const { lease: leaseOverrides = {}, ...entryOverrides } = overrides;
+  return {
+    lease: {
+      agent_id: agentId,
+      agent_label: "Claude",
+      client_surface: "t3-code",
+      ...leaseOverrides,
+    },
+    machine: "mbp",
+    ...entryOverrides,
+  };
 }
 
 /**
@@ -251,6 +328,35 @@ function seedDatabase(dbPath: string, nowMs: number): void {
 }
 
 describe("monitor", () => {
+  test("coalesces non-adjacent live sessions with the same identity", () => {
+    const { groupEntriesByIdentity } = browserIdentityInternals();
+    const firstClaude = browserIdentityEntry("Claude AAAAAAAAAAAAAAAA");
+    const codex = browserIdentityEntry("Codex BBBBBBBBBBBBBBBB", {
+      lease: { agent_label: "Codex" },
+    });
+    const secondClaude = browserIdentityEntry("Claude CCCCCCCCCCCCCCCC");
+    const claudeApp = browserIdentityEntry("Claude DDDDDDDDDDDDDDDD", {
+      lease: { client_surface: "claude-app" },
+    });
+    const otherMachine = browserIdentityEntry("Claude EEEEEEEEEEEEEEEE", {
+      machine: "mba",
+    });
+
+    const groups = groupEntriesByIdentity([
+      firstClaude,
+      codex,
+      secondClaude,
+      claudeApp,
+      otherMachine,
+    ]);
+    expect(groups.map((group) => group.entries.map((entry) => entry.lease.agent_id))).toEqual([
+      [firstClaude.lease.agent_id, secondClaude.lease.agent_id],
+      [codex.lease.agent_id],
+      [claudeApp.lease.agent_id],
+      [otherMachine.lease.agent_id],
+    ]);
+  });
+
   test("serves a valid empty payload when the database does not exist yet", async () => {
     const monitor = startTestMonitor(temporaryDatabasePath());
     const state = await fetchState(monitor);
@@ -713,8 +819,21 @@ describe("monitor", () => {
     // Keys pair machine with path; a machine name or path could contain any
     // separator byte, so the pair is JSON-encoded rather than joined.
     expect(html).toContain('JSON.stringify([entry.machine || "", root])');
-    // One session's finished tasks share a head, so the summaries stay scannable.
-    expect(html).toContain("function groupTasksBySession(tasks)");
+    // Live sessions with one agent/app identity coalesce across their worktree;
+    // recent work preserves chronology by grouping adjacent tasks only.
+    expect(html).toContain("function identityKey(agentLabel, agentId, clientSurface, machine)");
+    expect(html).toContain("function identityDescription(agentLabel, agentId, clientSurface, machine)");
+    expect(html).toContain("function groupEntriesByIdentity(entries)");
+    expect(html).toContain("var groupsByKey = new Map();");
+    expect(html).toContain("function groupTasksByIdentity(tasks)");
+    expect(html).toContain('cardHost = el("div", "agent-cluster")');
+    expect(html).toContain('var cardClass = sharedIdentity ? "card agent-cluster-card" : "card"');
+    expect(html).toContain('card.setAttribute(\n        "aria-label",\n        identityDescription(');
+    expect(html).toContain('sessions.size + " sessions"');
+    expect(html).toContain("meta.appendChild(sessionChip(task.agent_id");
+    expect(html).toContain(".worktree-group:last-of-type > .card:last-child,");
+    expect(html).toContain(".agent-cluster-card .card-byline {");
+    expect(html).toContain(".agent-cluster-card .session-chip {");
     // Finished tasks name their worktree only when a project's recents span
     // more than one.
     expect(html).toContain("var showWorktree = roots.size > 1;");
