@@ -211,30 +211,94 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     (afterCompletionOutput?.recent_peers as Array<Record<string, unknown>>)[0]?.summary,
   ).toBe("Finished flight plan");
 
+  // A stop without a reason must fail loudly instead of landing as a silent
+  // completion.
+  const reasonless = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Giving up on the flight plan",
+      cwd: directory,
+      lease_id: secondLeaseId,
+      state: "stopped",
+    },
+  });
+  expect(reasonless.isError).toBeTrue();
+
+  const stopped = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Flight plan review paused",
+      cwd: directory,
+      lease_id: secondLeaseId,
+      state: "stopped",
+      reason: "waiting on user: approve the new wording",
+    },
+  });
+  const stoppedOutput = stopped.structuredContent as Record<string, unknown> | undefined;
+  expect(stopped.isError).not.toBeTrue();
+  expect(stoppedOutput?.status).toBe("stopped");
+  expect(stoppedOutput?.self).toMatchObject({ active: false, state: "stopped", lease_id: null });
+
+  // The stop crosses the process boundary as its own outcome, with the
+  // stopping agent's reason attached.
+  const afterStop = await codex.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Pick the flight plan back up",
+      cwd: directory,
+      scopes: [{ path: "flight-plan.txt", access: "shared" }],
+      timebox: "15m",
+    },
+  });
+  expect(afterStop.isError).not.toBeTrue();
+  const afterStopOutput = afterStop.structuredContent as Record<string, unknown>;
+  expect(afterStopOutput?.status).toBe("granted");
+  expect(afterStopOutput?.recent_peers as Array<Record<string, unknown>>).toMatchObject([
+    {
+      outcome: "stopped",
+      reason: "waiting on user: approve the new wording",
+      summary: "Flight plan review paused",
+    },
+  ]);
+
   const database = new Database(dbPath, { readonly: true });
   const events = database
     .query(
-      "SELECT status, client_surface, agent_state, testing FROM activity_events ORDER BY event_id ASC",
+      "SELECT status, client_surface, agent_state, testing, stopped, reason FROM activity_events ORDER BY event_id ASC",
     )
     .all() as Array<{
       status: string;
       client_surface: string;
       agent_state: string;
       testing: number;
+      stopped: number;
+      reason: string | null;
     }>;
   database.close(false);
-  // The testing announcement stores the v2 "working" state plus the additive
-  // flag, so an older process reading this row still sees a live agent.
+  // The testing and stopped announcements store the v2 states plus additive
+  // flags, so an older process reading these rows still parses them. The
+  // reasonless stop above failed validation before reaching the store, so it
+  // must not appear here at all.
+  const plain = { testing: 0, stopped: 0, reason: null };
   expect(events).toEqual([
-    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "blocked", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "granted", client_surface: "cli", agent_state: "working", testing: 1 },
-    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
-    { status: "granted", client_surface: "cli", agent_state: "done", testing: 0 },
-    { status: "granted", client_surface: "cli", agent_state: "working", testing: 0 },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain, testing: 1 },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "done", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    {
+      status: "granted",
+      client_surface: "cli",
+      agent_state: "done",
+      testing: 0,
+      stopped: 1,
+      reason: "waiting on user: approve the new wording",
+    },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
   ]);
 });
 

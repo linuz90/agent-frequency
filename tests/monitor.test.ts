@@ -468,6 +468,42 @@ describe("monitor", () => {
     expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
   });
 
+  test("reports the additive stopped flag with its reason, and recorded blockers", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const database = new Database(dbPath, { strict: true });
+    // Matches the store's additive upgrade: a stop is agent_state 'done' plus
+    // the stopped flag and a reason; blocked calls carry blocker identity.
+    database.exec("ALTER TABLE activity_events ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0");
+    database.exec("ALTER TABLE activity_events ADD COLUMN reason TEXT");
+    database.exec("ALTER TABLE activity_events ADD COLUMN blockers TEXT NOT NULL DEFAULT '[]'");
+    database.exec(
+      `UPDATE activity_events
+       SET agent_state = 'done', stopped = 1, reason = 'waiting on user input'
+       WHERE agent_id = 'charlie'`,
+    );
+    database.exec(
+      `UPDATE activity_events
+       SET blockers = '[{"agent_id":"Codex A001","path":"src/auth"}]'
+       WHERE agent_id = 'bravo'`,
+    );
+    database.close(false);
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    const stopped = state.events.find((event) => event.agent_id === "charlie");
+    expect(stopped?.agent_state).toBe("stopped");
+    expect(stopped?.reason).toBe("waiting on user input");
+    const blocked = state.events.find((event) => event.agent_id === "bravo");
+    expect(blocked?.blockers).toEqual([{ agent_id: "Codex A001", path: "src/auth" }]);
+    // Rows and databases that predate the columns degrade to no stop and no
+    // blockers, never a hidden event.
+    const plain = state.events.find((event) => event.agent_id === "alpha");
+    expect(plain?.agent_state).toBe("working");
+    expect(plain?.reason).toBeNull();
+    expect(plain?.blockers).toEqual([]);
+  });
+
   test("bounds the activity payload and reports older retained events", async () => {
     const dbPath = temporaryDatabasePath();
     const nowMs = Date.now();
@@ -560,10 +596,17 @@ describe("monitor", () => {
     expect(html).toContain("function localMachineName(state)");
     expect(html).toContain("entries.push({ lease: lease, machine: local, homeDir: state.home_dir })");
     expect(html).toContain("function completionIcon(className)");
-    expect(html).toContain('event.agent_state === "done" ? completionIcon()');
-    expect(html).toContain('call.setAttribute("data-state", event.agent_state === "done" ? "done" : "working")');
+    expect(html).toContain('event.agent_state === "done"\n          ? completionIcon()');
     expect(html).toContain('if (event.agent_state === "done") return "claims released"');
     expect(html).toContain('? "completed work"');
+    // A stop is its own ending: amber octagon, the agent's reason quoted, and
+    // blocked calls name who was in the way.
+    expect(html).toContain("function stopIcon(className)");
+    expect(html).toContain('if (event.agent_state === "stopped") return "stopped unfinished, claims released"');
+    expect(html).toContain('? "stopped work"');
+    expect(html).toContain("function waitingText(blockers)");
+    expect(html).toContain('el("div", "waiting-note")');
+    expect(html).toContain('task.outcome === "stopped"');
     // A testing agent is live but holds nothing, so its card must say so
     // instead of reading like an ordinary set of claims.
     expect(html).toContain('var testing = lease.agent_state === "testing"');
@@ -593,17 +636,56 @@ describe("monitor", () => {
     expect(html).toContain("function recentTasks(state)");
     // Finished tasks render inside their project's section instead of a
     // separate feed, bounded per project and by a recency window.
-    expect(html).toContain("function renderRecentTasks(section, tasks)");
+    expect(html).toContain("function renderRecentTasks(section, tasks, defaultOpen)");
     expect(html).toContain("function groupTasksByRepo(tasks)");
-    expect(html).toContain('el("p", "recent-label", "Recent")');
+    expect(html).toContain('el("summary", "recent-label", "Recent")');
     expect(html).toContain("list.length < MAX_PROJECT_RECENT_TASKS");
     expect(html).toContain("task.ended_at_ms >= cutoff");
+    // Finished work stays collapsed under live agents so it can never push
+    // another project's running work below the fold, and a section with
+    // nothing but recent tasks still opens.
+    expect(html).toContain("renderRecentTasks(section, recent, false)");
+    expect(html).toContain("renderRecentTasks(section, tasks, true)");
+    // The choice is remembered per project for the life of the tab, in a
+    // shape that keeps peer-authored repository names as ordinary keys.
+    expect(html).toContain('var RECENT_STORAGE_KEY = "agent-frequency:recent-open"');
+    expect(html).toContain("window.sessionStorage.setItem(RECENT_STORAGE_KEY");
+    expect(html).toContain("entries.length > MAX_REMEMBERED_RECENTS");
+    expect(html).toContain("return new Map(");
+    expect(html).not.toContain("window.localStorage");
     expect(html).not.toContain("renderRecentWork");
+    // Worktrees are the collision boundary, so cards cluster under one head
+    // per checkout — but only when that tier distinguishes several worktrees
+    // or warns that agents share one.
+    expect(html).toContain("function groupEntriesByWorktree(entries)");
+    expect(html).toContain("function needsWorktreeTier(worktrees)");
+    expect(html).toContain("if (worktrees.length > 1) return true;");
+    expect(html).toContain("return worktree.entries.length > 1;");
+    expect(html).toContain('" agents in this worktree"');
+    // Nesting is expressed as real headings, so the outline matches the
+    // visual hierarchy: project h2, then worktree h3.
+    expect(html).toContain('el("h3", "worktree-branch mono"');
+    expect(html).toContain('" in " + worktrees.length + " worktrees"');
+    // Grouped cards drop the branch, path, and same-worktree chip their head
+    // now carries, so nothing is stated twice.
+    expect(html).toContain("sameWorktree && !grouped");
+    expect(html).toContain("if (lease.branch && !grouped)");
+    expect(html).toContain("if (lease.worktree_root && !grouped)");
+    // The machine only names a worktree when the project spans machines;
+    // otherwise every card's origin chip already said it.
+    expect(html).toContain("worktree.machine && showMachine");
+    // Keys pair machine with path; a machine name or path could contain any
+    // separator byte, so the pair is JSON-encoded rather than joined.
+    expect(html).toContain('JSON.stringify([entry.machine || "", root])');
     // One session's finished tasks share a head, so the summaries stay scannable.
     expect(html).toContain("function groupTasksBySession(tasks)");
-    // A finished run closes on its "done" call; a session that is still live
-    // stays out of past work because its own card already shows it.
-    expect(html).toContain('if (event.agent_state === "done") {');
+    // Finished tasks name their worktree only when a project's recents span
+    // more than one.
+    expect(html).toContain("var showWorktree = roots.size > 1;");
+    expect(html).toContain("function pathTail(path)");
+    // A finished run closes on its "done" or "stopped" call; a session that is
+    // still live stays out of past work because its own card already shows it.
+    expect(html).toContain('if (event.agent_state === "done" || event.agent_state === "stopped") {');
     expect(html).toContain("if (!active.has(key)) tasks.push(task);");
 
     const stateResponse = await fetch(`${monitor.url}api/state`);
@@ -791,7 +873,22 @@ describe("monitor", () => {
         event_count: 10_000,
         events_truncated: 0,
         events: [
-          { created_at_ms: nowMs, summary: "e", emoji: "‮🐛", status: "weird", event_type: "renewed" },
+          {
+            created_at_ms: nowMs,
+            summary: "e",
+            emoji: "‮🐛",
+            status: "weird",
+            event_type: "renewed",
+            reason: "r".repeat(1_000),
+            blockers: [
+              ...Array.from({ length: 20 }, (_, i) => ({
+                agent_id: "blocker-" + i,
+                path: "p".repeat(2_000),
+              })),
+              { agent_id: "", path: "dropped" },
+              "not-an-object",
+            ],
+          },
         ],
         peers: [{ url: "http://should-not-nest" }],
       }),
@@ -821,6 +918,11 @@ describe("monitor", () => {
     expect(clampedLease?.expires_at_ms).toBeLessThanOrEqual(Date.now() + 3 * 60 * 60 * 1_000);
     expect(snapshot?.events[0]?.status).toBe("granted");
     expect(snapshot?.events[0]?.emoji).toBeNull();
+    // Blockers and the stop reason are peer-authored too: bounded, truncated,
+    // and empty entries dropped.
+    expect(snapshot?.events[0]?.reason?.length).toBe(200);
+    expect(snapshot?.events[0]?.blockers.length).toBe(8);
+    expect(snapshot?.events[0]?.blockers[0]?.path.length).toBe(512);
     expect(snapshot?.event_count).toBe(10_000);
     expect(snapshot?.events_truncated).toBe(9_999);
     expect(JSON.stringify(state)).not.toContain("should-not-nest");

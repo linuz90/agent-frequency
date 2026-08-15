@@ -7,7 +7,7 @@ export const TIMEBOX_SECONDS = {
   "2h": 2 * 60 * 60,
 } as const;
 
-export const AGENT_STATES = ["working", "testing", "done"] as const;
+export const AGENT_STATES = ["working", "testing", "done", "stopped"] as const;
 export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
 
 export type Timebox = keyof typeof TIMEBOX_SECONDS;
@@ -17,15 +17,18 @@ export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
 
 export function normalizeAgentState(value: unknown): AgentState {
   if (value === "done") return "done";
+  if (value === "stopped") return "stopped";
   return value === "testing" ? "testing" : "working";
 }
 
 /**
- * Storage keeps the two v2 `agent_state` values and carries "testing" in an
- * additive flag column, so every read has to combine the two. See the schema
- * comment in store.ts for why the state did not become a third enum value.
+ * Storage keeps the two v2 `agent_state` values and carries "testing" and
+ * "stopped" in additive flag columns, so every read has to combine them. See
+ * the schema comment in store.ts for why neither became a new enum value.
+ * "stopped" wins: it is terminal, so no honest row sets both flags.
  */
-export function agentStateFromRow(state: unknown, testing: unknown): AgentState {
+export function agentStateFromRow(state: unknown, testing: unknown, stopped?: unknown): AgentState {
+  if (stopped) return "stopped";
   return testing ? "testing" : normalizeAgentState(state);
 }
 
@@ -61,6 +64,9 @@ export interface AnnounceInput {
   timebox?: Timebox;
   lease_id?: string;
   state?: AgentState;
+  // Why a run is ending without finishing. Required with state "stopped",
+  // ignored otherwise: "done" already means success and needs no explanation.
+  reason?: string;
   traffic_scope?: TrafficScope;
 }
 
@@ -142,16 +148,23 @@ export interface RecentPeer {
   emoji: string | null;
   summary: string;
   // "completed" when the agent's last word was a done announcement;
-  // "expired" when its lease lapsed without one — a crash or an abandoned
-  // session, so its work may be unfinished.
-  outcome: "completed" | "expired";
+  // "stopped" when it deliberately ended without finishing (reason says why,
+  // and its working-tree changes may be half-done); "expired" when its lease
+  // lapsed without a word — a crash or an abandoned session.
+  outcome: "completed" | "expired" | "stopped";
+  // The stopping agent's own words on why it did not finish; null unless the
+  // outcome is "stopped".
+  reason: string | null;
   repo: string;
   branch: string | null;
   last_heard: string;
 }
 
 export interface AnnounceOutput {
-  status: "granted" | "partial" | "blocked" | "completed";
+  // "completed" and "stopped" are the two terminal statuses: both mean the
+  // lease and claims were released, and they differ only in whether the work
+  // actually finished.
+  status: "granted" | "partial" | "blocked" | "completed" | "stopped";
   snapshot_at: string;
   traffic_scope: TrafficScope;
   self: {
@@ -197,6 +210,7 @@ export interface StoreAnnounceRequest {
   state: AgentState;
   trafficScope: TrafficScope;
   summary: string;
+  reason?: string | null;
   emoji?: string | null;
   metadata: GitMetadata;
   scopes: Scope[];

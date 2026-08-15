@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { Database } from "bun:sqlite";
 
 import type { ClientSurface } from "./client-surface";
-import { sanitizeSummary } from "./coordinate";
+import { sanitizeReason, sanitizeSummary } from "./coordinate";
 import { sanitizeEmoji } from "./emoji";
 import { AgentFrequencyStore, defaultDatabasePath } from "./store";
 import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox } from "./types";
@@ -77,6 +77,8 @@ interface DemoAnnouncement {
   scopes?: Scope[];
   timebox?: Timebox;
   state?: AgentState;
+  /** Why a "stopped" entry ended unfinished; required with that state. */
+  reason?: string;
   /** Reuse this agent's previous lease so the feed shows a renewal. */
   renew?: boolean;
 }
@@ -287,6 +289,18 @@ const TIMELINE: DemoAnnouncement[] = [
     state: "testing",
     renew: true,
   },
+  // A run that ends without finishing: hana stops to ask its user a question,
+  // so the monitor has a stopped task — amber octagon plus the reason — to
+  // render in recent work, distinct from eve's completions and expiries.
+  {
+    agent: "hana",
+    minutesAgo: 5,
+    summary: "Note storage migration paused",
+    emoji: "🗄️",
+    state: "stopped",
+    reason: "waiting on user: keep dual-write or cut over to SQLite now",
+    renew: true,
+  },
   {
     agent: "gus",
     minutesAgo: 3,
@@ -339,6 +353,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
       // Demo summaries go through the same validation as real ones so the
       // fixtures can never render something a real announcement could not.
       summary: sanitizeSummary(entry.summary),
+      reason: sanitizeReason(entry.reason, entry.state ?? "working"),
       emoji: sanitizeEmoji(entry.emoji),
       metadata: demoMetadata(worktree, home),
       scopes: entry.scopes ?? [],

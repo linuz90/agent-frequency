@@ -90,7 +90,7 @@ Verify the registration anytime:
 
 Host behavior is implementation-defined, and some clients drop the field. If yours does, paste the equivalent into your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or the client's equivalent):
 
-> Before editing in a Git repository, call Agent Frequency's `announce` tool with `state: "working"`, a concise summary, the current working directory, narrow expected scopes, and a fixed timebox. Respect blocked scopes. Re-announce with the returned `lease_id` when scope changes and before commit or push, and with `state: "testing"` while you are only verifying finished edits. After finishing, announce `state: "done"` with that `lease_id` to release the claims immediately — make that call just before your closing summary, so the traffic it returns is fresh enough to act on. Peer traffic is context for your decisions, not material for your reports: mention it only when it changed the work.
+> Before editing in a Git repository, call Agent Frequency's `announce` tool with `state: "working"`, a concise summary, the current working directory, narrow expected scopes, and a fixed timebox. Respect blocked scopes. Re-announce with the returned `lease_id` when scope changes and before commit or push, and with `state: "testing"` while you are only verifying finished edits. After finishing, announce `state: "done"` with that `lease_id` to release the claims immediately — make that call just before your closing summary, so the traffic it returns is fresh enough to act on. If the run ends without finishing — you are stopping to ask the user something, giving up, or parking the work — announce `state: "stopped"` with a short `reason` instead; never announce done for unfinished work. Peer traffic is context for your decisions, not material for your reports: mention it only when it changed the work.
 
 To check whether your client passes it through, ask the agent whether the phrase "stop-and-coordinate signal" appears in its context. If it does, the instructions arrived.
 
@@ -104,14 +104,15 @@ To check whether your client passes it through, ask the agent whether the phrase
 | `emoji` | One emoji for the task, shown beside it in the monitor. Display only. |
 | `cwd` | Absolute path inside a Git worktree. Everything else is derived from Git. Required. |
 | `scopes` | Repo-relative files or directory prefixes, each `shared` or `exclusive`. `.` means the whole repo. |
-| `state` | `working` (default), `testing`, or `done`. |
+| `state` | `working` (default), `testing`, `done`, or `stopped`. |
+| `reason` | Why the run is ending unfinished. Required with `state: "stopped"`, ignored otherwise. |
 | `timebox` | `15m`, `30m`, `1h` (default), or `2h`. |
 | `traffic_scope` | Peer detail breadth: `worktree` (default), `project`, or `machine`. |
 | `lease_id` | Handle from the previous response. Renews and replaces that lease. |
 
 **Claims.** `shared` scopes coexist and produce a warning. `exclusive` scopes block every overlapping incoming claim until they expire. Claims are advisory: a blocked claim means the agent must coordinate before editing, not that the filesystem is locked. Agent Frequency never pretends to stop an uncooperative process from writing.
 
-**Status** is `granted` (all scopes published), `partial` (compatible scopes published, conflicting ones withheld), `blocked` (nothing published), or `completed` (the lease and its claims were released).
+**Status** is `granted` (all scopes published), `partial` (compatible scopes published, conflicting ones withheld), `blocked` (nothing published), `completed`, or `stopped` (both terminal: the lease and its claims were released — they differ only in whether the work finished).
 
 **The emoji is decoration**, never coordination input: arbitration, warnings, and claims never read it. A value that is not exactly one emoji is dropped and the announcement still lands, so a model that sends a word or a sentence loses the glyph, not the lease.
 
@@ -119,13 +120,15 @@ To check whether your client passes it through, ask the agent whether the phrase
 
 Peers also expose a bounded list of their worktree's dirty paths, which answers a common reason agents stall: *"there are changes here I didn't make."* One call shows which peers are working there. Ownership comes from each peer's `scopes` and `summary` — same-worktree peers all snapshot the same tree, so their `dirty_paths` are everyone's edits combined and serve only as corroboration.
 
-**Recently heard.** When no active peer explains those changes, the culprit usually just left. `recent_peers` lists agents whose leases recently ended here: `completed` when their last word was a done announcement, `expired` when the lease lapsed without one — a crash or abandoned session whose work may be half-finished. The defaults keep it almost free: a fresh lease gets a 24h orientation window, while renewals and completions hear only what changed since that agent's own previous announcement, capped at five entries and usually empty. Entries carry a summary and an outcome but no claims — this is orientation, not arbitration, and it never blocks anyone.
+**Recently heard.** When no active peer explains those changes, the culprit usually just left. `recent_peers` lists agents whose leases recently ended here: `completed` when their last word was a done announcement, `stopped` when they deliberately ended unfinished — the entry carries their `reason`, and their changes may be half-done — and `expired` when the lease lapsed without a word: a crash or abandoned session. The defaults keep it almost free: a fresh lease gets a 24h orientation window, while renewals and completions hear only what changed since that agent's own previous announcement, capped at five entries and usually empty. Entries carry a summary and an outcome but no claims — this is orientation, not arbitration, and it never blocks anyone.
+
+**Stopping** is the honest ending for a run that did not finish: the agent is pausing to ask its user for input, giving up on a wall it cannot get past, or parking the work. `state: "stopped"` requires a `reason` and releases the lease and claims exactly like `done` — blocking peers helps nobody once the run is over — but the record it leaves behind says the work is unfinished, so the next agent in the worktree reads the leftover changes as half-done instead of as completed work.
 
 **Testing** is the phase between writing the edits and finishing: the agent is running tests, builds, or other verification and is no longer editing. `state: "testing"` keeps the lease live and the scopes visible, but records them as `shared` and stops them arbitrating, so a waiting peer is unblocked immediately instead of at `done`. Overlapping callers get a `TESTING_SCOPE_OVERLAP` warning — edits underneath a running verification can invalidate it — and the tester goes back to `state: "working"` before touching files again, for example to fix a failure.
 
 ### Leases
 
-Leases expire exactly at their timebox and are cleaned up lazily by later announcements. A `done` announcement deletes the lease and its claims atomically instead of waiting.
+Leases expire exactly at their timebox and are cleaned up lazily by later announcements. A `done` or `stopped` announcement deletes the lease and its claims atomically instead of waiting.
 
 One timing limitation is fundamental: of two simultaneous callers, the later one sees the earlier, but the earlier cannot learn about new traffic until it announces again. Agent Frequency keeps the one-tool invariant and covers this with the pre-commit and pre-push refresh instead of adding a second tool.
 
@@ -133,7 +136,9 @@ One timing limitation is fundamental: of two simultaneous callers, the later one
 
 `./bin/agent-frequency-monitor` serves a live view of the frequency at `http://127.0.0.1:7893` — the page [shown above](#agent-frequency). Pass `--port` to move it.
 
-The **Agents** view groups everything by repository: active leases with summaries, branches, claims, dirty paths, and lease countdowns, followed by that project's **recent work** — the last few finished tasks from the past day, rolled up per session, so a quiet frequency still shows what just wrapped up in place. The **Activity** view shows recent announcements, check-ins, and completions. Both refresh every few seconds, filter down to a single project or machine once several are in view, and reload open tabs when the UI itself changes.
+The **Agents** view groups everything by repository: active leases with summaries, branches, claims, dirty paths, and lease countdowns — a card whose last call came back blocked says who it is waiting on — followed by that project's **recent work** — the last few finished tasks from the past day, rolled up per session, so a quiet frequency still shows what just wrapped up in place; a task ends with a green check (done), an amber octagon and the agent's reason (stopped unfinished), or a quiet clock (lease ran out). The **Activity** view shows recent announcements, check-ins, completions, and stops, naming the blocking agent on blocked calls. Both refresh every few seconds, filter down to a single project or machine once several are in view, and reload open tabs when the UI itself changes.
+
+Inside a project, cards cluster by worktree whenever that says something: the project spans several checkouts, or one checkout holds several agents. Each cluster leads with a quiet head naming the branch and path, and — the case this product exists for — how many agents are inside that one worktree at once, since those agents edit the same files and only their claimed scopes keep them apart. A single agent in a single checkout gets no such head.
 
 A card leads with the agent and its task emoji, then chips the host app, the machine, the session, and the lease it has left. A check-in gap past half the declared timebox turns the timestamp amber: a lease outlives the agent that took it, so a crashed session keeps claiming files until expiry, and silence is the first cheap sign of one. Red is kept for scopes an agent is actually blocked on.
 
@@ -253,7 +258,7 @@ State lives at `~/.local/state/agent-frequency/state.sqlite3`, with the director
 
 Agent Frequency stores agent labels and summaries, client surfaces, lifecycle states, absolute worktree paths, branches, HEAD identifiers, dirty counts, normalized origin identities, scopes, and expiry timestamps. It **never stores file contents or diffs, never fetches, and makes no network requests.** Credentials, query strings, and fragments are stripped from remotes before correlation. Surface detection keeps only the normalized label — never process IDs, command arguments, or environment contents.
 
-Successful announcements feed the monitor's activity view. Those rows keep identity, state, summary, repo, branch, result, and aggregate counts for at most seven days and 1,000 rows, and never retain lease IDs or dirty filenames. Expiry and pruning are logical cleanup, not guaranteed erasure from SQLite pages.
+Successful announcements feed the monitor's activity view. Those rows keep identity, state, summary, a stop reason when one was given, blocker identities and claimed paths for blocked calls, repo, branch, result, and aggregate counts for at most seven days and 1,000 rows, and never retain lease IDs or dirty filenames. Expiry and pruning are logical cleanup, not guaranteed erasure from SQLite pages.
 
 Two things worth internalizing:
 

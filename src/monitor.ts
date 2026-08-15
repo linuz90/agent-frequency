@@ -35,6 +35,8 @@ const MAX_PEER_LEASES = 200;
 const MAX_PEER_CLAIMS = 64;
 // Matches MAX_DIRTY_PATHS in store.ts: an honest peer never sends more.
 const MAX_PEER_DIRTY_PATHS = 40;
+// Matches MAX_EVENT_BLOCKERS in store.ts for the same reason.
+const MAX_PEER_EVENT_BLOCKERS = 8;
 // Local leases can never expire more than the 2h timebox bucket ahead; allow
 // peer clocks an extra hour of slack before clamping their expiries.
 const MAX_PEER_EXPIRY_AHEAD_MS = 3 * 60 * 60 * 1_000;
@@ -77,6 +79,12 @@ export interface MonitorLease {
 export type MonitorEventType = "announced" | "renewed";
 export type MonitorEventStatus = "granted" | "partial" | "blocked";
 
+/** Who a blocked or partial call was waiting on, and on which claimed path. */
+export interface MonitorEventBlocker {
+  agent_id: string;
+  path: string;
+}
+
 export interface MonitorEvent {
   event_id: number;
   event_type: MonitorEventType;
@@ -86,6 +94,9 @@ export interface MonitorEvent {
   client_surface: ClientSurface;
   agent_state: AgentState;
   summary: string;
+  // The agent's own words on why it stopped without finishing; null unless
+  // agent_state is "stopped".
+  reason: string | null;
   emoji: string | null;
   repo_name: string;
   worktree_root: string;
@@ -93,6 +104,7 @@ export interface MonitorEvent {
   requested_scope_count: number;
   granted_scope_count: number;
   blocked_scope_count: number;
+  blockers: MonitorEventBlocker[];
   peer_count: number;
   created_at_ms: number;
 }
@@ -550,6 +562,7 @@ function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): Monit
     client_surface: normalizeClientSurface(row.client_surface),
     agent_state: normalizeAgentState(row.agent_state),
     summary: boundedPeerText(row.summary, 200),
+    reason: boundedPeerNullableText(row.reason, 200),
     // Stricter than bounding: a peer's emoji is only rendered when it really is
     // a single emoji, so a remote monitor cannot inject a text banner here.
     emoji: sanitizeEmoji(row.emoji),
@@ -559,9 +572,22 @@ function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): Monit
     requested_scope_count: boundedPeerCount(row.requested_scope_count),
     granted_scope_count: boundedPeerCount(row.granted_scope_count),
     blocked_scope_count: boundedPeerCount(row.blocked_scope_count),
+    blockers: sanitizePeerBlockers(row.blockers),
     peer_count: boundedPeerCount(row.peer_count),
     created_at_ms: createdAtMs,
   };
+}
+
+function sanitizePeerBlockers(value: unknown): MonitorEventBlocker[] {
+  return boundedArray(value, MAX_PEER_EVENT_BLOCKERS)
+    .map((entry) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+      const row = entry as Record<string, unknown>;
+      const agentId = boundedPeerText(row.agent_id, 120).trim();
+      if (agentId.length === 0) return null;
+      return { agent_id: agentId, path: boundedPeerText(row.path, 512) };
+    })
+    .filter((entry): entry is MonitorEventBlocker => entry !== null);
 }
 
 function boundedArray(value: unknown, maxItems: number): unknown[] {
@@ -605,14 +631,23 @@ function readEvents(
     const testingColumn = hasColumn(database, "activity_events", "testing")
       ? "testing"
       : "0 AS testing";
+    const stoppedColumn = hasColumn(database, "activity_events", "stopped")
+      ? "stopped"
+      : "0 AS stopped";
+    const reasonColumn = hasColumn(database, "activity_events", "reason")
+      ? "reason"
+      : "NULL AS reason";
+    const blockersColumn = hasColumn(database, "activity_events", "blockers")
+      ? "blockers"
+      : "'[]' AS blockers";
     const emojiColumn = hasColumn(database, "activity_events", "emoji")
       ? "emoji"
       : "NULL AS emoji";
     const rows = database
       .query(
-        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, summary, ${emojiColumn},
+        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${stoppedColumn}, ${reasonColumn}, summary, ${emojiColumn},
                 repo_name, worktree_root, branch, requested_scope_count,
-                granted_scope_count, blocked_scope_count, peer_count, created_at_ms,
+                granted_scope_count, blocked_scope_count, ${blockersColumn}, peer_count, created_at_ms,
                 count(*) OVER () AS total_count
          FROM activity_events
          WHERE created_at_ms >= ?
@@ -644,8 +679,9 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
     agent_id: toText(row.agent_id),
     agent_label: toText(row.agent_label),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: agentStateFromRow(row.agent_state, row.testing),
+    agent_state: agentStateFromRow(row.agent_state, row.testing, row.stopped),
     summary: toText(row.summary),
+    reason: toNullableText(row.reason),
     emoji: sanitizeEmoji(row.emoji),
     repo_name: toText(row.repo_name),
     worktree_root: toText(row.worktree_root),
@@ -653,9 +689,35 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
     requested_scope_count: toNullableInteger(row.requested_scope_count) ?? 0,
     granted_scope_count: toNullableInteger(row.granted_scope_count) ?? 0,
     blocked_scope_count: toNullableInteger(row.blocked_scope_count) ?? 0,
+    blockers: toBlockerList(row.blockers),
     peer_count: toNullableInteger(row.peer_count) ?? 0,
     created_at_ms: toNullableInteger(row.created_at_ms) ?? 0,
   };
+}
+
+/**
+ * `blockers` is a JSON array added after schema v2's event table first
+ * shipped, so it can be missing, NULL, or unparseable in an older database.
+ * Every one of those degrades to "no recorded blockers", never a hidden event.
+ */
+function toBlockerList(value: unknown): MonitorEventBlocker[] {
+  if (typeof value !== "string" || value.length === 0) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .slice(0, MAX_PEER_EVENT_BLOCKERS)
+      .map((entry) => {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
+        const row = entry as Record<string, unknown>;
+        const agentId = toText(row.agent_id);
+        if (agentId.length === 0) return null;
+        return { agent_id: agentId, path: toText(row.path) };
+      })
+      .filter((entry): entry is MonitorEventBlocker => entry !== null);
+  } catch {
+    return [];
+  }
 }
 
 function toEventStatus(value: unknown): MonitorEventStatus {

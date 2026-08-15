@@ -41,6 +41,11 @@ const ACTIVITY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 // gap, and far shorter than activity retention.
 const MAX_RECENT_PEERS = 5;
 const RECENT_PEER_WINDOW_MS = 24 * 60 * 60 * 1_000;
+// Blocker identity persisted with a blocked or partial event, so the monitor
+// can say who was waiting on whom — the announce response computes the full
+// list but hands it only to the blocked caller. Bounded like every other
+// peer-authored payload; blocked_scope_count still carries the true totals.
+const MAX_EVENT_BLOCKERS = 8;
 const SCHEMA_VERSION = 2;
 const BUSY_RETRY_DELAYS_MS = [0, 25, 100, 250] as const;
 
@@ -152,11 +157,14 @@ export class AgentFrequencyStore {
 
   announce(request: StoreAnnounceRequest): AnnounceOutput {
     const nowMs = request.nowMs ?? Date.now();
-    // Completion is a lifecycle signal, not another claim request. Ignoring
-    // stale caller scopes also lets an agent release its lease after moving or
-    // deleting paths that were valid when the work started.
-    const scopes =
-      request.state === "done" ? [] : asAdvisoryScopes(normalizeScopes(request.scopes), request.state);
+    // "done" and "stopped" are both lifecycle signals, not claim requests:
+    // either way the run is over and nothing will edit further, so the lease
+    // and claims release identically — the two differ only in what the record
+    // says about the work. Ignoring stale caller scopes also lets an agent
+    // release its lease after moving or deleting paths that were valid when
+    // the work started.
+    const terminal = request.state === "done" || request.state === "stopped";
+    const scopes = terminal ? [] : asAdvisoryScopes(normalizeScopes(request.scopes), request.state);
     const timeboxSeconds = TIMEBOX_SECONDS[request.timebox];
     const expiresAtMs = nowMs + timeboxSeconds * 1_000;
     let leaseId = request.leaseId ?? randomBytes(16).toString("hex");
@@ -171,7 +179,7 @@ export class AgentFrequencyStore {
       transactionOpen = true;
       this.database.query("DELETE FROM leases WHERE expires_at_ms <= ?").run(nowMs);
 
-      if (request.state === "done") {
+      if (terminal) {
         const output = this.completeAnnouncement(request, nowMs);
         this.recordActivity(request, output, 0, this.getPeerRows("").length, nowMs);
         this.database.exec("COMMIT");
@@ -343,15 +351,16 @@ export class AgentFrequencyStore {
     const peers = peerCandidates.map(stripPeerCandidate);
     const visible = this.selectVisiblePeers(peerCandidates, request, []);
 
+    const stopped = request.state === "stopped";
     return {
-      status: "completed",
+      status: stopped ? "stopped" : "completed",
       snapshot_at: toIso(nowMs),
       traffic_scope: request.trafficScope,
       self: {
         lease_id: null,
         renewed: false,
         active: false,
-        state: "done",
+        state: request.state,
         agent_id: request.agentId,
         surface: request.clientSurface,
         emoji: request.emoji ?? null,
@@ -373,7 +382,9 @@ export class AgentFrequencyStore {
       peers_truncated: visible.truncated,
       warnings: this.buildWarnings(request, [], [], peers),
       retry_at: null,
-      message: "Completion announced; active lease and claims released",
+      message: stopped
+        ? "Stop announced; active lease and claims released, and the reason is recorded for peers"
+        : "Completion announced; active lease and claims released",
     };
   }
 
@@ -445,6 +456,8 @@ export class AgentFrequencyStore {
         agent_label: string;
         client_surface: string;
         agent_state: string;
+        stopped: number | null;
+        reason: string | null;
         emoji: string | null;
         summary: string;
         repo_name: string;
@@ -458,7 +471,10 @@ export class AgentFrequencyStore {
       surface: normalizeClientSurface(row.client_surface),
       emoji: row.emoji,
       summary: row.summary,
-      outcome: row.agent_state === "done" ? "completed" : "expired",
+      // A stop stores agent_state "done" plus the additive flag, so the flag
+      // has to be read first or every stop reads back as completed work.
+      outcome: row.stopped ? "stopped" : row.agent_state === "done" ? "completed" : "expired",
+      reason: row.stopped ? (row.reason ?? null) : null,
       repo: row.repo_name,
       branch: row.branch,
       last_heard: toIso(row.created_at_ms),
@@ -771,19 +787,21 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO activity_events (
-           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, summary, emoji, repo_name,
+           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, stopped, reason, summary, emoji, repo_name,
            worktree_root, branch, requested_scope_count, granted_scope_count,
-           blocked_scope_count, peer_count, created_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           blocked_scope_count, blockers, peer_count, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        request.state === "done" ? "announced" : output.self.renewed ? "renewed" : "announced",
-        output.status === "completed" ? "granted" : output.status,
+        output.self.renewed ? "renewed" : "announced",
+        output.status === "completed" || output.status === "stopped" ? "granted" : output.status,
         request.agentId,
         request.agentLabel,
         request.clientSurface,
         storedAgentState(request.state),
         request.state === "testing" ? 1 : 0,
+        request.state === "stopped" ? 1 : 0,
+        request.state === "stopped" ? (request.reason ?? null) : null,
         request.summary,
         request.emoji ?? null,
         request.metadata.repoName,
@@ -792,6 +810,7 @@ export class AgentFrequencyStore {
         requestedScopeCount,
         output.self.granted_scopes.length,
         output.self.blocked_scopes.length,
+        JSON.stringify(eventBlockers(output.self.blocked_scopes)),
         peerCount,
         nowMs,
       );
@@ -824,9 +843,29 @@ function asAdvisoryScopes(scopes: Scope[], state: AgentState): Scope[] {
 }
 
 // Only "working" and "done" are storable agent_state values; see the testing
-// column comment in initializeSchema.
+// column comment in initializeSchema. A stop is stored as "done" plus the
+// additive stopped flag: both are terminal, and rows written by processes
+// that predate the flag keep reading back unchanged.
 function storedAgentState(state: AgentState): "working" | "done" {
-  return state === "done" ? "done" : "working";
+  return state === "done" || state === "stopped" ? "done" : "working";
+}
+
+// What the event feed keeps of a blocked or partial response: who was in the
+// way and on which claimed path. Deduplicated and bounded — the response's
+// full Blocker list stays per-call, and blocked_scope_count keeps the totals.
+function eventBlockers(blockedScopes: BlockedScope[]): Array<{ agent_id: string; path: string }> {
+  const seen = new Set<string>();
+  const blockers: Array<{ agent_id: string; path: string }> = [];
+  for (const scope of blockedScopes) {
+    for (const blocker of scope.blockers) {
+      const key = JSON.stringify([blocker.agent_id, blocker.path]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      blockers.push({ agent_id: blocker.agent_id, path: blocker.path });
+      if (blockers.length >= MAX_EVENT_BLOCKERS) return blockers;
+    }
+  }
+  return blockers;
 }
 
 function compareOverlaps(
@@ -971,7 +1010,7 @@ function retryAdvice(retryAtMs: number | null, nowMs: number): string {
 }
 
 function statusMessage(
-  status: Exclude<AnnounceOutput["status"], "completed">,
+  status: Exclude<AnnounceOutput["status"], "completed" | "stopped">,
   state: AgentState,
   grantedCount: number,
   blockedCount: number,
@@ -1081,6 +1120,30 @@ function initializeSchema(database: Database): void {
       "testing",
       "INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1))",
     );
+    // "stopped" follows the testing precedent exactly: a terminal state
+    // carried as an additive flag beside agent_state "done" rather than a
+    // widened CHECK. It only ever describes events (a stopped lease is
+    // deleted), so the leases table never carries it. The reason and the
+    // blocker identities ride along the same way — display and orientation
+    // data, nullable or defaulted so older processes' rows stay valid.
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "stopped",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1))",
+    );
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "reason",
+      "TEXT CHECK (reason IS NULL OR length(reason) <= 200)",
+    );
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "blockers",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
     // The task emoji is display-only, so it stays additive and nullable for the
     // same reason: rolling it out must not drop a live lease or the feed, and
     // rows written by an older process simply carry no emoji.
@@ -1176,6 +1239,8 @@ CREATE TABLE IF NOT EXISTS activity_events (
   agent_state TEXT NOT NULL DEFAULT 'working'
     CHECK (agent_state IN ('working', 'done')),
   testing INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1)),
+  stopped INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1)),
+  reason TEXT CHECK (reason IS NULL OR length(reason) <= 200),
   summary TEXT NOT NULL,
   emoji TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH}),
   repo_name TEXT NOT NULL,
@@ -1184,6 +1249,7 @@ CREATE TABLE IF NOT EXISTS activity_events (
   requested_scope_count INTEGER NOT NULL,
   granted_scope_count INTEGER NOT NULL,
   blocked_scope_count INTEGER NOT NULL,
+  blockers TEXT NOT NULL DEFAULT '[]',
   peer_count INTEGER NOT NULL,
   created_at_ms INTEGER NOT NULL
 );

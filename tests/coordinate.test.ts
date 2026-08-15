@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { coordinateAnnouncement, sanitizeSummary } from "../src/coordinate";
+import { coordinateAnnouncement, sanitizeReason, sanitizeSummary } from "../src/coordinate";
 
 const temporaryDirectories: string[] = [];
 
@@ -21,6 +21,26 @@ describe("sanitizeSummary", () => {
   test("rejects empty and oversized summaries", () => {
     expect(() => sanitizeSummary("\n\t")).toThrow("visible text");
     expect(() => sanitizeSummary("x".repeat(161))).toThrow("at most 160");
+  });
+});
+
+describe("sanitizeReason", () => {
+  test("requires a reason for a stopped announcement", () => {
+    expect(() => sanitizeReason(undefined, "stopped")).toThrow("requires a reason");
+    expect(() => sanitizeReason("\n\t", "stopped")).toThrow("requires a reason");
+    expect(() => sanitizeReason("x".repeat(201), "stopped")).toThrow("at most 200");
+  });
+
+  test("cleans the reason like a summary", () => {
+    expect(sanitizeReason("  waiting on\n‮user  input ", "stopped")).toBe(
+      "waiting on user input",
+    );
+  });
+
+  test("drops the reason for every non-stopped state", () => {
+    expect(sanitizeReason("ignored", "working")).toBeNull();
+    expect(sanitizeReason("ignored", "done")).toBeNull();
+    expect(sanitizeReason(undefined, "working")).toBeNull();
   });
 });
 

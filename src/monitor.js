@@ -41,6 +41,53 @@
   // Expanded path lists survive re-renders; a three-second refresh must
   // not keep closing a list the user just opened.
   var openDetails = new Set();
+  // Recent work collapses by default so a project's finished tasks can
+  // never push another project's live agents below the fold — the whole
+  // point of the page is what is running now. A reader who opens one is
+  // remembered per project for the life of the tab, which is the span
+  // over which that choice stays meaningful.
+  var RECENT_STORAGE_KEY = "agent-frequency:recent-open";
+  var MAX_REMEMBERED_RECENTS = 50;
+  var recentOpen = loadRecentOpen();
+
+  // Repository names are peer-authored, so the stored shape is an entry
+  // array read into a Map: names such as "__proto__" stay ordinary keys.
+  function loadRecentOpen() {
+    try {
+      var raw = window.sessionStorage.getItem(RECENT_STORAGE_KEY);
+      if (!raw) return new Map();
+      var parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return new Map();
+      return new Map(
+        parsed.filter(function (entry) {
+          return (
+            Array.isArray(entry) &&
+            typeof entry[0] === "string" &&
+            typeof entry[1] === "boolean"
+          );
+        })
+      );
+    } catch (error) {
+      // Disabled or full storage is not worth a broken page; the
+      // defaults simply stop being remembered.
+      return new Map();
+    }
+  }
+
+  function rememberRecentOpen(name, open) {
+    recentOpen.delete(name);
+    recentOpen.set(name, open);
+    var entries = Array.from(recentOpen.entries());
+    if (entries.length > MAX_REMEMBERED_RECENTS) {
+      entries = entries.slice(entries.length - MAX_REMEMBERED_RECENTS);
+      recentOpen = new Map(entries);
+    }
+    try {
+      window.sessionStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(entries));
+    } catch (error) {
+      /* see loadRecentOpen */
+    }
+  }
 
   // === DOM helpers ===
 
@@ -163,6 +210,20 @@
     return icon;
   }
 
+  // A deliberate stop without a finish: an octagon, between the completion
+  // check and the quiet clock — the agent said it was ending, and said why.
+  function stopIcon(className) {
+    var icon = svgEl(className || "stop-icon");
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "2");
+    icon.setAttribute("stroke-linejoin", "round");
+    svgShape(icon, "polygon", {
+      points: "7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86",
+    });
+    return icon;
+  }
+
   // === Clocks and relative time ===
 
   function now() {
@@ -247,6 +308,14 @@
   }
 
   // === Agent identity chips ===
+
+  // The worktree's own folder name — the part managed-worktree tools vary
+  // per task (`.t3/worktrees/islands/t3code-aeb1ed1b`).
+  function pathTail(path) {
+    if (!path) return "";
+    var parts = path.split("/").filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : path;
+  }
 
   function abbreviate(path, homeDir) {
     if (!homeDir || !path) return path || "";
@@ -392,6 +461,53 @@
     return total;
   }
 
+  // === Blockers ===
+
+  // Agent ids are "<label> <hex suffix>"; the last four suffix characters
+  // are enough to tell two same-label sessions apart in a short mention.
+  function blockerName(agentId) {
+    var id = agentId || "agent";
+    var space = id.lastIndexOf(" ");
+    if (space <= 0) return id.length > 12 ? id.slice(0, 12) + "…" : id;
+    var suffix = id.slice(space + 1);
+    return id.slice(0, space) + " " + (suffix.length > 4 ? suffix.slice(suffix.length - 4) : suffix);
+  }
+
+  // "waiting on Claude 8754" (+ optionally "and N more"), with the full
+  // blocker ids and claimed paths in the title. Blocker identity is recorded
+  // with the event by the announce call itself, so this is server-observed
+  // rather than self-reported.
+  function waitingText(blockers) {
+    var names = [];
+    blockers.forEach(function (blocker) {
+      var name = blockerName(blocker.agent_id);
+      if (names.indexOf(name) === -1) names.push(name);
+    });
+    var text = "waiting on " + names.slice(0, 2).join(", ");
+    if (names.length > 2) text += " and " + (names.length - 2) + " more";
+    return text;
+  }
+
+  function waitingTitle(blockers) {
+    return blockers
+      .map(function (blocker) {
+        return blocker.agent_id + (blocker.path ? " holds " + blocker.path : "");
+      })
+      .join("\n");
+  }
+
+  // The freshest call each session made in each worktree, so a live card can
+  // show whether its agent's last word was "blocked". Self-clearing: the next
+  // granted announce becomes the latest event and the note disappears.
+  function latestEventsByTask(state) {
+    var latest = new Map();
+    eventEntries(state).forEach(function (entry) {
+      var key = taskKey(entry.machine, entry.event.agent_id, entry.event.worktree_root);
+      if (!latest.has(key)) latest.set(key, entry.event);
+    });
+    return latest;
+  }
+
   // === Recent tasks ===
 
   // The activity feed is a log of individual calls. The Agents view wants
@@ -438,11 +554,15 @@
           branch: event.branch,
           started_at_ms: event.created_at_ms,
           ended_at_ms: event.created_at_ms,
-          released: false,
+          // "released" when closed by done, "stopped" when the agent ended
+          // the run unfinished and said why, "expired" when it went quiet.
+          outcome: "expired",
+          reason: null,
         };
       }
-      if (event.agent_state === "done") {
-        task.released = true;
+      if (event.agent_state === "done" || event.agent_state === "stopped") {
+        task.outcome = event.agent_state === "stopped" ? "stopped" : "released";
+        task.reason = event.reason || null;
         tasks.push(task);
         open.delete(key);
       } else {
@@ -513,8 +633,32 @@
     return groups;
   }
 
-  function renderRecentTasks(section, tasks) {
-    section.appendChild(el("p", "recent-label", "Recent"));
+  /**
+   * A project's finished tasks, behind a disclosure. `defaultOpen` is for
+   * a section that holds nothing else — collapsing it would leave a bare
+   * heading — and a remembered choice for this project wins over it.
+   */
+  function renderRecentTasks(section, tasks, defaultOpen) {
+    var name = repoName(tasks[0]);
+    var details = el("details", "recent-details");
+    details.agentFrequencyKey = "recent\u0000" + name;
+    var remembered = recentOpen.get(name);
+    details.open = remembered === undefined ? defaultOpen === true : remembered;
+    details.addEventListener("toggle", function () {
+      rememberRecentOpen(name, details.open);
+    });
+    details.appendChild(el("summary", "recent-label", "Recent"));
+    section.appendChild(details);
+
+    // Branch usually identifies the checkout a task ran in, but not when a
+    // project has several worktrees on it — then the folder name is what
+    // separates them, so it only appears when it distinguishes something.
+    var roots = new Set(
+      tasks.map(function (task) {
+        return task.worktree_root || "";
+      })
+    );
+    var showWorktree = roots.size > 1;
 
     groupTasksBySession(tasks).forEach(function (sessionTasks) {
       var newest = sessionTasks[0];
@@ -529,17 +673,29 @@
       var origin = originChip(newest.client_surface, newest.machine);
       if (origin) groupHead.appendChild(origin);
       groupHead.appendChild(sessionChip(newest.agent_id, label));
-      // The repository is already the section this group sits in, so
-      // the head only carries the branch.
-      if (newest.branch) {
-        groupHead.appendChild(el("span", "task-group-where mono", newest.branch));
+      // The repository is already the section this group sits in, so the
+      // head carries only what still varies inside it.
+      var where = newest.branch || "";
+      if (showWorktree && newest.worktree_root) {
+        where = where ? where + " · " + pathTail(newest.worktree_root) : pathTail(newest.worktree_root);
+      }
+      if (where) {
+        var whereEl = el("span", "task-group-where mono", where);
+        if (newest.worktree_root) whereEl.title = newest.worktree_root;
+        groupHead.appendChild(whereEl);
       }
       group.appendChild(groupHead);
 
       sessionTasks.forEach(function (task) {
         var row = el("div", "task-row");
-        row.setAttribute("data-outcome", task.released ? "released" : "expired");
-        row.appendChild(task.released ? completionIcon("task-icon") : quietIcon());
+        row.setAttribute("data-outcome", task.outcome);
+        row.appendChild(
+          task.outcome === "released"
+            ? completionIcon("task-icon")
+            : task.outcome === "stopped"
+              ? stopIcon("task-icon")
+              : quietIcon()
+        );
         row.appendChild(summaryLine("task-summary", task.emoji, task.summary));
         var timestamp = el("time", "task-time");
         trackTime(timestamp, "event", task.ended_at_ms);
@@ -549,7 +705,12 @@
         // carries only what sets it apart: how it ended, how long it ran,
         // and a branch that differs from the rest of the session.
         var meta = el("div", "task-meta");
-        if (!task.released) meta.appendChild(el("span", null, "lease ran out"));
+        if (task.outcome === "expired") meta.appendChild(el("span", null, "lease ran out"));
+        if (task.outcome === "stopped") {
+          meta.appendChild(
+            el("span", "task-reason", "stopped: " + (task.reason || "unfinished"))
+          );
+        }
         // Only the calls still inside the seven-day window are visible, so
         // a task that started before it reads as shorter than it ran.
         var span = task.ended_at_ms - task.started_at_ms;
@@ -562,7 +723,7 @@
         group.appendChild(row);
       });
 
-      section.appendChild(group);
+      details.appendChild(group);
     });
   }
 
@@ -588,6 +749,43 @@
 
   function repoName(item) {
     return item.repo_name || "unknown repo";
+  }
+
+  /**
+   * Worktrees are where agents actually collide: two sessions in one
+   * checkout edit the same files, while two worktrees of the same project
+   * are independent. Grouping by (machine, worktree_root) mirrors the
+   * arbitration boundary the server already uses — the same absolute path
+   * on two machines is two different checkouts.
+   */
+  function groupEntriesByWorktree(entries) {
+    var order = [];
+    var groups = new Map();
+    entries.forEach(function (entry) {
+      var root = entry.lease.worktree_root || "";
+      // JSON encoding keeps the pair unambiguous without a separator
+      // byte that a machine name or path could itself contain.
+      var key = JSON.stringify([entry.machine || "", root]);
+      if (!groups.has(key)) {
+        groups.set(key, { key: key, root: root, machine: entry.machine, entries: [] });
+        order.push(key);
+      }
+      groups.get(key).entries.push(entry);
+    });
+    return order.map(function (key) {
+      return groups.get(key);
+    });
+  }
+
+  // The tier earns its place by distinguishing (the project spans several
+  // worktrees) or by warning (one worktree holds several agents, the
+  // configuration this whole product exists to make visible). One agent in
+  // one checkout gets no extra chrome.
+  function needsWorktreeTier(worktrees) {
+    if (worktrees.length > 1) return true;
+    return worktrees.some(function (worktree) {
+      return worktree.entries.length > 1;
+    });
   }
 
   function repoNames(entries) {
@@ -741,7 +939,51 @@
     return counts;
   }
 
-  function renderCard(entry, sameWorktree) {
+  /**
+   * The identity line for one checkout: its branch, its path, and — the
+   * reason this tier exists — how many agents are inside it at once. Two
+   * agents in one worktree edit the same files, so that count is the
+   * page's clearest collision signal and it reads as emphasis, not alarm:
+   * sharing a checkout is normal, it just has to be visible.
+   */
+  function renderWorktreeHead(worktree, homeDir, showMachine) {
+    var lease = worktree.entries[0].lease;
+    var head = el("div", "worktree-head");
+    var identity = el("div", "worktree-identity");
+    // A real subheading under the project's h2, so the page outlines the way
+    // it reads: project, then checkout, then the agents inside it.
+    identity.appendChild(el("h3", "worktree-branch mono", lease.branch || "detached HEAD"));
+    if (worktree.root) {
+      var path = el("span", "worktree-path mono", abbreviate(worktree.root, homeDir));
+      path.title = worktree.root;
+      identity.appendChild(path);
+    }
+    // The same absolute path on two machines is two checkouts, so the
+    // machine names this line — but only when the project actually spans
+    // machines. Otherwise every card's origin chip already said it.
+    if (worktree.machine && showMachine) {
+      identity.appendChild(el("span", "worktree-machine", worktree.machine));
+    }
+    head.appendChild(identity);
+    if (worktree.entries.length > 1) {
+      var shared = el(
+        "span",
+        "worktree-shared",
+        worktree.entries.length + " agents in this worktree"
+      );
+      shared.title =
+        "These agents share one checkout, so they edit the same files. Claimed scopes are what keeps them apart.";
+      head.appendChild(shared);
+    }
+    return head;
+  }
+
+  /**
+   * `grouped` is set when the card sits under a worktree head that already
+   * carries its branch, path, and any shared-checkout warning, so the card
+   * drops those rather than repeating them on every row.
+   */
+  function renderCard(entry, sameWorktree, latestEvent, grouped) {
     var lease = entry.lease;
     var homeDir = entry.homeDir;
     var card = el("article", "card");
@@ -760,7 +1002,7 @@
         lease.agent_label,
         lease.agent_id,
         lease.client_surface,
-        sameWorktree,
+        sameWorktree && !grouped,
         entry.machine
       )
     );
@@ -776,10 +1018,32 @@
       content.appendChild(bubble);
     }
 
+    // The agent's last call came back blocked or partial, so it is waiting on
+    // (or working around) another agent's claim. Read off the recorded event,
+    // not self-reported, and gone the moment a later call is granted.
+    if (
+      latestEvent &&
+      (latestEvent.status === "blocked" || latestEvent.status === "partial") &&
+      (latestEvent.blockers || []).length > 0
+    ) {
+      var waiting = el("div", "waiting-note");
+      waiting.setAttribute("data-status", latestEvent.status);
+      waiting.title = waitingTitle(latestEvent.blockers);
+      waiting.appendChild(
+        el(
+          "span",
+          null,
+          waitingText(latestEvent.blockers) +
+            (latestEvent.status === "partial" ? " for some scopes" : "")
+        )
+      );
+      content.appendChild(waiting);
+    }
+
     var meta = el("div", "meta");
     if (testing) meta.appendChild(el("span", "agent-state", "testing"));
-    if (lease.branch) meta.appendChild(el("span", "mono", lease.branch));
-    if (lease.worktree_root) {
+    if (lease.branch && !grouped) meta.appendChild(el("span", "mono", lease.branch));
+    if (lease.worktree_root && !grouped) {
       meta.appendChild(el("span", "mono path", abbreviate(lease.worktree_root, homeDir)));
     }
     var dirty = renderDirty(lease);
@@ -887,6 +1151,7 @@
     var entries = visibleLeases(state);
     var groups = groupByRepo(entries);
     var sessionClusters = countSessionClusters(entries);
+    var latestEvents = latestEventsByTask(state);
     var tasksByRepo = groupTasksByRepo(visibleTasks(state));
     var recentCount = 0;
     tasksByRepo.forEach(function (tasks) {
@@ -964,6 +1229,14 @@
         var head = el("div", "group-head");
         head.appendChild(el("h2", "group-name mono", group.name));
         var recent = tasksByRepo.get(group.name) || [];
+        var worktrees = groupEntriesByWorktree(group.entries);
+        var tiered = needsWorktreeTier(worktrees);
+        var spansMachines =
+          new Set(
+            worktrees.map(function (worktree) {
+              return worktree.machine || "";
+            })
+          ).size > 1;
         head.appendChild(
           el(
             "p",
@@ -971,21 +1244,42 @@
             group.entries.length +
               " agent" +
               (group.entries.length === 1 ? "" : "s") +
+              // Spelling out the spread here is what tells a reader whether
+              // those agents are working side by side or in isolation.
+              (worktrees.length > 1 ? " in " + worktrees.length + " worktrees" : "") +
               (recent.length > 0 ? " · " + recent.length + " recent" : "")
           )
         );
         section.appendChild(head);
-        group.entries.forEach(function (entry) {
-          var clusterKey = sessionClusterKey(entry);
-          section.appendChild(
-            renderCard(
-              entry,
-              clusterKey !== null && (sessionClusters.get(clusterKey) || 0) > 1
-            )
-          );
+
+        worktrees.forEach(function (worktree) {
+          var host = section;
+          if (tiered) {
+            host = el("div", "worktree-group");
+            host.appendChild(
+              renderWorktreeHead(worktree, worktree.entries[0].homeDir, spansMachines)
+            );
+            section.appendChild(host);
+          }
+          worktree.entries.forEach(function (entry) {
+            var clusterKey = sessionClusterKey(entry);
+            host.appendChild(
+              renderCard(
+                entry,
+                clusterKey !== null && (sessionClusters.get(clusterKey) || 0) > 1,
+                latestEvents.get(
+                  taskKey(entry.machine, entry.lease.agent_id, entry.lease.worktree_root)
+                ),
+                tiered
+              )
+            );
+          });
         });
         if (recent.length > 0) {
-          renderRecentTasks(section, recent);
+          // Collapsed under live agents: this section already has the
+          // content a reader came for, and the head above counts what is
+          // hidden.
+          renderRecentTasks(section, recent, false);
           tasksByRepo.delete(group.name);
         }
         fragment.appendChild(section);
@@ -1007,7 +1301,9 @@
         )
       );
       section.appendChild(head);
-      renderRecentTasks(section, tasks);
+      // Nothing is running here, so the recent tasks are the section:
+      // collapsing them would leave a heading and no content.
+      renderRecentTasks(section, tasks, true);
       fragment.appendChild(section);
     });
 
@@ -1018,17 +1314,30 @@
 
   function activityStatus(event) {
     if (event.agent_state === "done") return "claims released";
+    if (event.agent_state === "stopped") return "stopped unfinished, claims released";
     // A testing agent keeps its lease but stops locking files, so the
     // scope counts below would read as claims it no longer holds.
     if (event.agent_state === "testing") return "verifying, claims released";
     if (event.requested_scope_count === 0) return "listening only";
-    if (event.status === "partial") return "some scopes blocked";
-    if (event.status === "blocked") return "blocked by an active claim";
+    // Recorded blocker identity turns "an active claim" into a name.
+    var blockers = event.blockers || [];
+    if (event.status === "partial") {
+      return blockers.length > 0 ? "partly blocked, " + waitingText(blockers) : "some scopes blocked";
+    }
+    if (event.status === "blocked") {
+      return blockers.length > 0 ? "blocked, " + waitingText(blockers) : "blocked by an active claim";
+    }
     return "no known conflict";
   }
 
   function activityScopes(event) {
-    if (event.agent_state === "done" || event.agent_state === "testing") return null;
+    if (
+      event.agent_state === "done" ||
+      event.agent_state === "stopped" ||
+      event.agent_state === "testing"
+    ) {
+      return null;
+    }
     if (event.requested_scope_count === 0) return null;
     if (event.status === "partial") {
       return (
@@ -1096,12 +1405,21 @@
     shown.forEach(function (entry) {
       var event = entry.event;
       var call = el("article", "activity-call");
-      call.setAttribute("data-state", event.agent_state === "done" ? "done" : "working");
+      call.setAttribute(
+        "data-state",
+        event.agent_state === "done" || event.agent_state === "stopped"
+          ? event.agent_state
+          : "working"
+      );
       var label = event.agent_label || event.agent_id;
       var avatar = el("div", "activity-avatar");
       avatar.setAttribute("aria-hidden", "true");
       avatar.appendChild(
-        event.agent_state === "done" ? completionIcon() : providerIcon(label, event.agent_id)
+        event.agent_state === "done"
+          ? completionIcon()
+          : event.agent_state === "stopped"
+            ? stopIcon()
+            : providerIcon(label, event.agent_id)
       );
       call.appendChild(avatar);
 
@@ -1128,11 +1446,13 @@
           "activity-verb",
           event.agent_state === "done"
             ? "completed work"
-            : event.agent_state === "testing"
-              ? "started testing"
-              : event.event_type === "renewed"
-                ? "checked in again"
-                : "announced work"
+            : event.agent_state === "stopped"
+              ? "stopped work"
+              : event.agent_state === "testing"
+                ? "started testing"
+                : event.event_type === "renewed"
+                  ? "checked in again"
+                  : "announced work"
         )
       );
       origin.appendChild(el("span", null, "in"));
@@ -1151,11 +1471,17 @@
         "data-status",
         event.agent_state === "done"
           ? "completed"
-          : event.agent_state === "testing"
-            ? "testing"
-            : event.status
+          : event.agent_state === "stopped"
+            ? "stopped"
+            : event.agent_state === "testing"
+              ? "testing"
+              : event.status
       );
+      if ((event.blockers || []).length > 0) status.title = waitingTitle(event.blockers);
       outcome.appendChild(status);
+      if (event.agent_state === "stopped" && event.reason) {
+        outcome.appendChild(el("span", "activity-reason", "“" + event.reason + "”"));
+      }
       var scopeText = activityScopes(event);
       if (scopeText) outcome.appendChild(el("span", null, scopeText));
       outcome.appendChild(
@@ -1242,7 +1568,7 @@
     var focusedDetailsKey = null;
     var focusedElement = document.activeElement;
     if (focusedElement && focusedElement.tagName === "SUMMARY") {
-      var focusedDetails = focusedElement.closest(".agent-details");
+      var focusedDetails = focusedElement.closest(".agent-details, .recent-details");
       if (focusedDetails) focusedDetailsKey = focusedDetails.agentFrequencyKey;
     }
     timeNodes = [];
@@ -1259,7 +1585,7 @@
     );
     if (focusedDetailsKey !== null) {
       Array.prototype.some.call(
-        main.querySelectorAll(".agent-details"),
+        main.querySelectorAll(".agent-details, .recent-details"),
         function (details) {
           if (details.agentFrequencyKey !== focusedDetailsKey) return false;
           var disclosure = details.querySelector("summary");

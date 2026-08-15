@@ -28,6 +28,24 @@ export function sanitizeSummary(value: string): string {
   return summary;
 }
 
+/**
+ * The reason is what makes a "stopped" announcement worth having: without one,
+ * a stop is indistinguishable from an expiry to everybody reading it later, so
+ * the state refuses to land silently. For every other state it is dropped —
+ * "done" already means success, and a live state's story is its summary.
+ */
+export function sanitizeReason(value: string | undefined, state: string): string | null {
+  const reason = (value ?? "").replace(UNSAFE_FORMATTING, " ").replace(/\s+/gu, " ").trim();
+  if (state !== "stopped") return null;
+  if (!reason) {
+    throw new Error('state "stopped" requires a reason: say briefly why the run is ending unfinished');
+  }
+  if (reason.length > 200) {
+    throw new Error("reason must be at most 200 characters");
+  }
+  return reason;
+}
+
 export async function coordinateAnnouncement(
   input: AnnounceInput,
   agent: AgentIdentity,
@@ -44,6 +62,7 @@ export async function coordinateAnnouncement(
       state: input.state ?? "working",
       trafficScope: input.traffic_scope ?? "worktree",
       summary: sanitizeSummary(input.summary),
+      reason: sanitizeReason(input.reason, input.state ?? "working"),
       // An unusable emoji is decoration, not coordination data: drop it and let
       // the announcement through rather than failing a safety-relevant call.
       emoji: sanitizeEmoji(input.emoji),

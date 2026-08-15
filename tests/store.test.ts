@@ -936,6 +936,95 @@ describe("AgentFrequencyStore schema versioning", () => {
   });
 });
 
+describe("stopped announcements", () => {
+  test("stopped releases the lease and claims exactly like done", () => {
+    const { store, dbPath } = createStoreWithPath();
+    const alpha = store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    const blocked = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+    expect(blocked.status).toBe("blocked");
+
+    const stop = store.announce(
+      request("alpha", [], {
+        state: "stopped",
+        reason: "waiting on user: keep or revert the token change",
+        leaseId: alpha.self.lease_id!,
+        summary: "Auth refactor paused",
+        nowMs: 1_800_000_002_000,
+      }),
+    );
+    expect(stop.status).toBe("stopped");
+    expect(stop.self).toMatchObject({ lease_id: null, active: false, state: "stopped" });
+    expect(stop.message).toContain("Stop announced");
+
+    const retry = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+        nowMs: 1_800_000_003_000,
+      }),
+    );
+    expect(retry.status).toBe("granted");
+
+    // Storage keeps the v2 agent_state values and carries the stop additively,
+    // beside the reason the caller gave.
+    const database = new Database(dbPath, { readonly: true });
+    const event = database
+      .query(
+        `SELECT agent_state, stopped, reason FROM activity_events
+         WHERE agent_id = 'alpha' ORDER BY event_id DESC LIMIT 1`,
+      )
+      .get() as Record<string, unknown>;
+    database.close(false);
+    expect(event).toEqual({
+      agent_state: "done",
+      stopped: 1,
+      reason: "waiting on user: keep or revert the token change",
+    });
+  });
+
+  test("a blocked call records who was blocking, bounded and deduplicated", () => {
+    const { store, dbPath } = createStoreWithPath();
+    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    const blocked = store.announce(
+      request(
+        "bravo",
+        [
+          { path: "src/auth/token.ts", access: "exclusive" },
+          { path: "src/auth/session.ts", access: "exclusive" },
+        ],
+        { nowMs: 1_800_000_001_000 },
+      ),
+    );
+    expect(blocked.status).toBe("blocked");
+
+    const database = new Database(dbPath, { readonly: true });
+    const event = database
+      .query(
+        `SELECT status, blockers FROM activity_events
+         WHERE agent_id = 'bravo' ORDER BY event_id DESC LIMIT 1`,
+      )
+      .get() as { status: string; blockers: string };
+    database.close(false);
+    expect(event.status).toBe("blocked");
+    // Both blocked scopes hit the same claim, so the record keeps one entry.
+    expect(JSON.parse(event.blockers)).toEqual([{ agent_id: "alpha", path: "src/auth" }]);
+  });
+
+  test("a granted call records no blockers", () => {
+    const { store, dbPath } = createStoreWithPath();
+    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+
+    const database = new Database(dbPath, { readonly: true });
+    const event = database
+      .query("SELECT blockers FROM activity_events ORDER BY event_id DESC LIMIT 1")
+      .get() as { blockers: string };
+    database.close(false);
+    expect(JSON.parse(event.blockers)).toEqual([]);
+  });
+});
+
 describe("recent peers", () => {
   const T = 1_800_000_000_000;
   const MINUTE = 60_000;
@@ -968,6 +1057,46 @@ describe("recent peers", () => {
       repo: "example",
       branch: "main",
     });
+  });
+
+  test("an agent that stopped unfinished is reported as stopped, with its reason", () => {
+    const store = createStore();
+    const alpha = store.announce(
+      request("alpha", [{ path: "src/auth", access: "exclusive" }], { nowMs: T }),
+    );
+    store.announce(
+      request("alpha", [], {
+        state: "stopped",
+        reason: "typecheck fails in auth, out of ideas",
+        leaseId: alpha.self.lease_id ?? undefined,
+        summary: "alpha paused the auth work",
+        nowMs: T + 5 * MINUTE,
+      }),
+    );
+
+    const observer = store.announce(request("beta", [], { nowMs: T + 10 * MINUTE }));
+    expect(observer.recent_peers).toHaveLength(1);
+    expect(observer.recent_peers[0]).toMatchObject({
+      agent_id: "alpha",
+      outcome: "stopped",
+      reason: "typecheck fails in auth, out of ideas",
+      summary: "alpha paused the auth work",
+    });
+  });
+
+  test("completed and expired entries carry no reason", () => {
+    const store = createStore();
+    const alpha = store.announce(request("alpha", [], { nowMs: T }));
+    store.announce(
+      request("alpha", [], {
+        state: "done",
+        leaseId: alpha.self.lease_id ?? undefined,
+        nowMs: T + MINUTE,
+      }),
+    );
+
+    const observer = store.announce(request("beta", [], { nowMs: T + 2 * MINUTE }));
+    expect(observer.recent_peers[0]).toMatchObject({ outcome: "completed", reason: null });
   });
 
   test("an agent whose lease lapsed without done is reported as expired", () => {

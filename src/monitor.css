@@ -286,13 +286,19 @@ h1 {
   border-bottom: 1px solid var(--border);
 }
 
+/* The page has three nested levels — project, worktree, agent — so each
+   container has to outrank what it holds. The project name therefore runs
+   above the summary text inside it; the worktree head sits below both. It
+   stays monospace because a repository name is an identifier, not prose.
+   Set after .mono so this size wins over that rule's relative 0.92em. */
 .group-name {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--fg);
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
 .group-meta {
@@ -317,6 +323,61 @@ h1 {
    a full-width divider there only adds noise next to the indented content. */
 .group .card:last-of-type {
   border-bottom: 0;
+}
+
+/* A worktree is a container inside a project, so its cards sit under one
+   quiet head rather than repeating the branch and path on every row. The
+   rule above still has to reach the last card of the last worktree. */
+.worktree-group:last-of-type .card:last-of-type {
+  border-bottom: 0;
+}
+
+.worktree-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 3px 12px;
+  padding: 18px 0 3px;
+}
+
+.worktree-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 10px;
+  min-width: 0;
+}
+
+/* One step under the project name and under the card text it introduces:
+   the branch is the subheading's subject, the path beside it is reference. */
+.worktree-branch {
+  margin: 0;
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.worktree-path {
+  min-width: 0;
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.worktree-machine {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+/* Two agents in one checkout edit the same files. That is ordinary and
+   often deliberate, so it reads as plain emphasis — the alarm colours stay
+   reserved for a scope somebody is actually blocked on. */
+.worktree-shared {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .agent-label {
@@ -497,6 +558,20 @@ h1 {
   color: var(--alert);
 }
 
+/* A live agent whose last call came back blocked: red because a scope is
+   actually blocked (the one thing red is reserved for), amber when only
+   part of the request was. */
+.waiting-note {
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--alert);
+}
+
+.waiting-note[data-status="partial"] {
+  color: var(--warning);
+}
+
 .activity-call {
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);
@@ -525,6 +600,14 @@ h1 {
   color: var(--live);
 }
 
+/* Its amber sibling: the run ended on purpose, the work did not finish. */
+.stop-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: var(--warning);
+}
+
 /* Past work is denser than live traffic: one session's finished tasks all
    share an identity, so the repeated agent, session, and repository move
    up into a group head and each task keeps one scannable row. Indented to
@@ -537,10 +620,16 @@ h1 {
   color: var(--fg-muted);
 }
 
+.recent-details {
+  margin-top: 0;
+}
+
 /* Separates a project's finished tasks from the live cards above them;
-   the label speaks once for every task group that follows it. */
+   the label speaks once for every task group that follows it. The 16px
+   disclosure marker sits inside the task indent, so the word itself
+   still lines up with the summaries below. */
 .recent-label {
-  margin: 22px 0 0 44px;
+  margin: 22px 0 0 28px;
   color: var(--fg-faint);
   font-size: 11px;
   letter-spacing: 0.04em;
@@ -597,6 +686,16 @@ h1 {
 
 .task-row[data-outcome="released"] .task-icon {
   color: var(--live);
+}
+
+/* A stop is a doubt, not a conflict: the work here is deliberately
+   unfinished, so it reads amber like the stale check-in signal. */
+.task-row[data-outcome="stopped"] .task-icon {
+  color: var(--warning);
+}
+
+.task-reason {
+  color: var(--fg);
 }
 
 .task-summary {
@@ -699,6 +798,15 @@ h1 {
 
 .activity-status[data-status="blocked"] {
   color: var(--alert);
+}
+
+.activity-status[data-status="stopped"] {
+  color: var(--warning);
+}
+
+/* The stopping agent's own words, quoted next to the amber status. */
+.activity-reason {
+  color: var(--fg);
 }
 
 .badges {
@@ -875,10 +983,14 @@ footer[data-peers]::after {
     height: 30px;
   }
 
-  /* Track the narrower card column above. */
-  .recent-label,
+  /* Track the narrower card column above; the label keeps the marker's
+     16px inside that indent. */
   .task-group {
     margin-left: 40px;
+  }
+
+  .recent-label {
+    margin-left: 24px;
   }
 }
 
