@@ -558,8 +558,11 @@
           // the run unfinished and said why, "expired" when it went quiet.
           outcome: "expired",
           reason: null,
+          // Whether this session ever announced anything but planning here.
+          edited: false,
         };
       }
+      if (event.agent_state !== "planning") task.edited = true;
       if (event.agent_state === "done" || event.agent_state === "stopped") {
         task.outcome = event.agent_state === "stopped" ? "stopped" : "released";
         task.reason = event.reason || null;
@@ -584,7 +587,12 @@
     // crosses the boundary, which is close enough for orientation.
     var cutoff = now() - RECENT_WINDOW_MS;
     return tasks.filter(function (task) {
-      return task.ended_at_ms >= cutoff;
+      if (task.ended_at_ms < cutoff) return false;
+      // A session that only ever planned and then let its lease lapse
+      // changed nothing and left nothing behind, so it is not recent work.
+      // One that planned and said done or stopped reported an outcome, and
+      // that is worth keeping whether or not it wrote a file.
+      return task.edited || task.outcome !== "expired";
     });
   }
 
@@ -988,7 +996,11 @@
     var homeDir = entry.homeDir;
     var card = el("article", "card");
     var testing = lease.agent_state === "testing";
-    card.setAttribute("data-state", testing ? "testing" : "working");
+    var planning = lease.agent_state === "planning";
+    // Neither advisory state holds a lock, so both drop the language of
+    // claims; they differ in what the paths mean, which the labels below say.
+    var advisory = testing || planning;
+    card.setAttribute("data-state", advisory ? lease.agent_state : "working");
     var label = lease.agent_label || lease.agent_id || "Agent";
     var avatar = el("div", "card-avatar");
     avatar.setAttribute("aria-hidden", "true");
@@ -1041,7 +1053,7 @@
     }
 
     var meta = el("div", "meta");
-    if (testing) meta.appendChild(el("span", "agent-state", "testing"));
+    if (advisory) meta.appendChild(el("span", "agent-state", lease.agent_state));
     if (lease.branch && !grouped) meta.appendChild(el("span", "mono", lease.branch));
     if (lease.worktree_root && !grouped) {
       meta.appendChild(el("span", "mono path", abbreviate(lease.worktree_root, homeDir)));
@@ -1090,8 +1102,9 @@
           return claim.access === "exclusive";
         }).length;
         // A testing agent holds no locks, so its paths are an
-        // advertisement of what a failing run would blame, not a claim.
-        if (testing) {
+        // advertisement of what a failing run would blame, not a claim; a
+        // planning agent's are only where it is currently reading.
+        if (advisory) {
           disclosure.appendChild(el("span", null, "not blocking"));
         } else if (exclusiveCount > 0) {
           disclosure.appendChild(
@@ -1118,7 +1131,11 @@
       if (lease.claims.length > 0) {
         var claimsSection = el("div", "detail-section");
         claimsSection.appendChild(
-          el("p", "detail-label", testing ? "Scopes under test" : "Claimed scopes")
+          el(
+            "p",
+            "detail-label",
+            planning ? "Areas being read" : testing ? "Scopes under test" : "Claimed scopes"
+          )
         );
         var badges = el("div", "badges");
         lease.claims.forEach(function (claim) {
@@ -1318,6 +1335,9 @@
     // A testing agent keeps its lease but stops locking files, so the
     // scope counts below would read as claims it no longer holds.
     if (event.agent_state === "testing") return "verifying, claims released";
+    // A planner never claims, so it never blocks and is never blocked: the
+    // scope counts below describe reading, not a hold on anything.
+    if (event.agent_state === "planning") return "planning, nothing claimed";
     if (event.requested_scope_count === 0) return "listening only";
     // Recorded blocker identity turns "an active claim" into a name.
     var blockers = event.blockers || [];
@@ -1334,7 +1354,8 @@
     if (
       event.agent_state === "done" ||
       event.agent_state === "stopped" ||
-      event.agent_state === "testing"
+      event.agent_state === "testing" ||
+      event.agent_state === "planning"
     ) {
       return null;
     }
@@ -1450,9 +1471,11 @@
               ? "stopped work"
               : event.agent_state === "testing"
                 ? "started testing"
-                : event.event_type === "renewed"
-                  ? "checked in again"
-                  : "announced work"
+                : event.agent_state === "planning"
+                  ? "started planning"
+                  : event.event_type === "renewed"
+                    ? "checked in again"
+                    : "announced work"
         )
       );
       origin.appendChild(el("span", null, "in"));
@@ -1475,7 +1498,9 @@
             ? "stopped"
             : event.agent_state === "testing"
               ? "testing"
-              : event.status
+              : event.agent_state === "planning"
+                ? "planning"
+                : event.status
       );
       if ((event.blockers || []).length > 0) status.title = waitingTitle(event.blockers);
       outcome.appendChild(status);

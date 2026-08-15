@@ -543,8 +543,9 @@ h1 {
   color: var(--warning);
 }
 
-/* Testing is a normal phase of a healthy session, so it reads as plain
-   emphasis against the muted meta line rather than as a colour alert. */
+/* Testing and planning are normal phases of a healthy session, so they read
+   as plain emphasis against the muted meta line rather than as a colour
+   alert. */
 .agent-state {
   color: var(--fg);
   font-weight: 500;
@@ -802,6 +803,12 @@ h1 {
 
 .activity-status[data-status="stopped"] {
   color: var(--warning);
+}
+
+/* A planner holds nothing and can conflict with nobody, so its calls are the
+   quietest thing in the feed. */
+.activity-status[data-status="planning"] {
+  color: var(--fg-muted);
 }
 
 /* The stopping agent's own words, quoted next to the amber status. */

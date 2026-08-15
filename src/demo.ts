@@ -199,12 +199,17 @@ const TIMELINE: DemoAnnouncement[] = [
     scopes: [{ path: ".", access: "exclusive" }],
     timebox: "30m",
   },
+  // fin opens its run by planning, then edits, then tests: one session moving
+  // through every live state, so recent work keeps a task that began before a
+  // single file was touched.
   {
     agent: "fin",
     minutesAgo: 74,
     summary: "Read through the editor toolbar before touching anything",
     emoji: "👀",
+    scopes: [{ path: "app/editor", access: "shared" }],
     timebox: "15m",
+    state: "planning",
   },
   {
     agent: "bo",
@@ -309,12 +314,16 @@ const TIMELINE: DemoAnnouncement[] = [
     scopes: [{ path: "stacks/prod", access: "exclusive" }],
     timebox: "15m",
   },
+  // The newest call on the board is a live planner: it advertises where it is
+  // reading, claims nothing, and cannot block gus or anyone else.
   {
     agent: "dex",
     minutesAgo: 1,
     summary: "Trace a flaky auth test before changing anything",
     emoji: "🐛",
-    timebox: "1h",
+    scopes: [{ path: "src/auth", access: "shared" }],
+    timebox: "15m",
+    state: "planning",
   },
 ];
 

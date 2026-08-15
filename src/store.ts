@@ -9,8 +9,10 @@ import { normalizeClientSurface, type ClientSurface } from "./client-surface";
 import { MAX_EMOJI_LENGTH } from "./emoji";
 import { normalizeScopes, scopesOverlap } from "./scopes";
 import {
+  PLANNING_TIMEBOX,
   TIMEBOX_SECONDS,
   agentStateFromLease,
+  isAdvisoryState,
   type AgentState,
   type AnnounceOutput,
   type BlockedScope,
@@ -22,6 +24,7 @@ import {
   type RecentPeer,
   type Scope,
   type StoreAnnounceRequest,
+  type Timebox,
 } from "./types";
 
 const MAX_PEERS = 20;
@@ -60,6 +63,7 @@ interface LeaseRow {
   client_surface: ClientSurface | string;
   agent_state: string;
   testing: number | null;
+  planning: number | null;
   summary: string;
   emoji: string | null;
   project_id: string;
@@ -165,7 +169,8 @@ export class AgentFrequencyStore {
     // the work started.
     const terminal = request.state === "done" || request.state === "stopped";
     const scopes = terminal ? [] : asAdvisoryScopes(normalizeScopes(request.scopes), request.state);
-    const timeboxSeconds = TIMEBOX_SECONDS[request.timebox];
+    const timebox = effectiveTimebox(request.state, request.timebox);
+    const timeboxSeconds = TIMEBOX_SECONDS[timebox];
     const expiresAtMs = nowMs + timeboxSeconds * 1_000;
     let leaseId = request.leaseId ?? randomBytes(16).toString("hex");
     let renewed = false;
@@ -271,7 +276,9 @@ export class AgentFrequencyStore {
           emoji: request.emoji ?? null,
           expires_at: toIso(expiresAtMs),
           renew_after: toIso(nowMs + Math.floor((timeboxSeconds * 1_000 * 2) / 3)),
-          timebox: request.timebox,
+          // The effective value, not the requested one: a planning caller that
+          // asked for two hours has to be able to see it got fifteen minutes.
+          timebox,
           repo: request.metadata.repoName,
           worktree: request.metadata.worktreeRoot,
           branch: request.metadata.branch,
@@ -440,6 +447,17 @@ export class AgentFrequencyStore {
              WHERE leases.agent_id = events.agent_id
                AND leases.worktree_root = events.worktree_root
            )
+           -- An agent that only ever planned here never edited a file, so it
+           -- cannot explain a working-tree change and has no half-done work to
+           -- warn about — the two questions this list exists to answer. Tested
+           -- across every event, not just the latest: an agent that edited and
+           -- then went back to planning still owes the next agent that record.
+           AND EXISTS (
+             SELECT 1 FROM activity_events AS edits
+             WHERE edits.agent_id = events.agent_id
+               AND edits.worktree_root = events.worktree_root
+               AND edits.planning = 0
+           )
          ORDER BY events.created_at_ms DESC, events.event_id DESC
          LIMIT ${MAX_RECENT_PEERS}`,
       )
@@ -514,6 +532,16 @@ export class AgentFrequencyStore {
     const sharedOverlaps: EvaluatedScope["sharedOverlaps"] = [];
     const testingOverlaps: EvaluatedScope["testingOverlaps"] = [];
 
+    // Planning is symmetrical: a planner's paths neither block nor are blocked,
+    // and raise no overlap warnings in either direction. Blocking one would be
+    // worse than pointless — a blocked scope is never recorded as a claim, so
+    // the planner would drop off the board precisely in the busy worktree where
+    // seeing it matters. It still gets the peer list and the presence warnings,
+    // which is the traffic that can actually change a plan.
+    if (request.state === "planning") {
+      return { scope: incoming, blockers, sharedOverlaps, testingOverlaps };
+    }
+
     for (const peer of peers) {
       const relation = relationTo(peer, request);
       // Unrelated projects belong in the traffic snapshot, but their paths
@@ -521,13 +549,20 @@ export class AgentFrequencyStore {
       if (relation === "other_project") {
         continue;
       }
+      const peerClaims = claimsByLease.get(peer.lease_id) ?? [];
+      const peerState = agentStateFromLease(peer.agent_state, peer, peerClaims);
+      // A planning peer has written nothing, so nothing it advertises can be
+      // invalidated by an edit and nothing about it is worth reporting here.
+      // Its paths stay visible in the traffic snapshot and stop there: a
+      // planner that could warn, let alone block, would invert the product.
+      if (peerState === "planning") {
+        continue;
+      }
       // A testing peer has stopped editing, so its paths are advertisement
       // rather than a claim: they still surface as a warning, because edits
       // underneath a running verification can invalidate it, but they never
       // block. That is the point of the state — hand the files back early.
-      const peerClaims = claimsByLease.get(peer.lease_id) ?? [];
-      const peerTesting =
-        agentStateFromLease(peer.agent_state, peer.testing, peerClaims) === "testing";
+      const peerTesting = peerState === "testing";
       for (const existing of peerClaims) {
         if (!scopesOverlap(incoming, existing, request.metadata.ignoreCase || Boolean(peer.ignore_case))) {
           continue;
@@ -566,16 +601,17 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO leases (
-           lease_id, agent_id, agent_label, client_surface, agent_state, testing, summary, emoji, project_id, local_repo_id, repo_name,
+           lease_id, agent_id, agent_label, client_surface, agent_state, testing, planning, summary, emoji, project_id, local_repo_id, repo_name,
            worktree_id, worktree_root, branch, head_oid, ignore_case, dirty, dirty_count,
            dirty_paths, metadata_complete, timebox_seconds, created_at_ms, updated_at_ms, expires_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(lease_id) DO UPDATE SET
            agent_id = excluded.agent_id,
            agent_label = excluded.agent_label,
            client_surface = excluded.client_surface,
            agent_state = excluded.agent_state,
            testing = excluded.testing,
+           planning = excluded.planning,
            summary = excluded.summary,
            emoji = excluded.emoji,
            project_id = excluded.project_id,
@@ -601,6 +637,7 @@ export class AgentFrequencyStore {
         request.clientSurface,
         storedAgentState(request.state),
         request.state === "testing" ? 1 : 0,
+        request.state === "planning" ? 1 : 0,
         request.summary,
         request.emoji ?? null,
         metadata.projectId,
@@ -632,11 +669,7 @@ export class AgentFrequencyStore {
         agent_id: row.agent_id,
         label: row.agent_label,
         surface: normalizeClientSurface(row.client_surface),
-        state: agentStateFromLease(
-          row.agent_state,
-          row.testing,
-          claimsByLease.get(row.lease_id) ?? [],
-        ),
+        state: agentStateFromLease(row.agent_state, row, claimsByLease.get(row.lease_id) ?? []),
         summary: row.summary,
         // Older processes never write the column, so treat missing as none.
         emoji: row.emoji ?? null,
@@ -734,8 +767,15 @@ export class AgentFrequencyStore {
       });
     }
 
+    // Presence warnings describe who might edit the same files, so planning
+    // peers are excluded from raising them: an agent still reading the code
+    // cannot collide with anyone. The asymmetry is deliberate and is what keeps
+    // the state cheap — a planner receives every warning it would otherwise
+    // get, and generates none. Without it, a busy worktree would warn about
+    // agents that hold nothing, and these codes would become noise to skip.
+    const editingPeers = peers.filter((peer) => peer.state !== "planning");
     const sameWorktreeAgents = uniqueAgentIds(
-      peers.filter((peer) => peer.relation === "same_worktree"),
+      editingPeers.filter((peer) => peer.relation === "same_worktree"),
     );
     if (sameWorktreeAgents.length > 0) {
       warnings.push({
@@ -745,7 +785,7 @@ export class AgentFrequencyStore {
     }
 
     const sameBranchAgents = uniqueAgentIds(
-      peers.filter(
+      editingPeers.filter(
         (peer) =>
           peer.relation !== "same_worktree" &&
           peer.relation !== "other_project" &&
@@ -787,10 +827,10 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO activity_events (
-           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, stopped, reason, summary, emoji, repo_name,
+           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, planning, stopped, reason, summary, emoji, repo_name,
            worktree_root, branch, requested_scope_count, granted_scope_count,
            blocked_scope_count, blockers, peer_count, created_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         output.self.renewed ? "renewed" : "announced",
@@ -800,6 +840,7 @@ export class AgentFrequencyStore {
         request.clientSurface,
         storedAgentState(request.state),
         request.state === "testing" ? 1 : 0,
+        request.state === "planning" ? 1 : 0,
         request.state === "stopped" ? 1 : 0,
         request.state === "stopped" ? (request.reason ?? null) : null,
         request.summary,
@@ -831,12 +872,13 @@ export class AgentFrequencyStore {
   }
 }
 
-// A testing agent is verifying what it already wrote, so it holds no locks:
-// its paths are recorded as shared advertisements that peers can see and edit
-// through. Requested access is downgraded rather than rejected so an agent can
-// hand the same scope list back with one changed field.
+// Neither advisory state holds locks: a testing agent is verifying what it
+// already wrote, and a planning agent has not written anything yet. Their paths
+// are recorded as shared advertisements that peers can see and edit through.
+// Requested access is downgraded rather than rejected so an agent can hand the
+// same scope list back with one changed field.
 function asAdvisoryScopes(scopes: Scope[], state: AgentState): Scope[] {
-  if (state !== "testing") return scopes;
+  if (!isAdvisoryState(state)) return scopes;
   return scopes.map((scope) =>
     scope.access === "shared" ? scope : { path: scope.path, access: "shared" },
   );
@@ -845,9 +887,16 @@ function asAdvisoryScopes(scopes: Scope[], state: AgentState): Scope[] {
 // Only "working" and "done" are storable agent_state values; see the testing
 // column comment in initializeSchema. A stop is stored as "done" plus the
 // additive stopped flag: both are terminal, and rows written by processes
-// that predate the flag keep reading back unchanged.
+// that predate the flag keep reading back unchanged. Planning stores "working"
+// beside its own flag for the same reason.
 function storedAgentState(state: AgentState): "working" | "done" {
   return state === "done" || state === "stopped" ? "done" : "working";
+}
+
+// A planning phase that outlives the shortest bucket should say so out loud by
+// renewing, so the requested timebox is overridden rather than trusted.
+function effectiveTimebox(state: AgentState, requested: Timebox): Timebox {
+  return state === "planning" ? PLANNING_TIMEBOX : requested;
 }
 
 // What the event feed keeps of a blocked or partial response: who was in the
@@ -911,6 +960,10 @@ function peerActionRank(
   request: StoreAnnounceRequest,
   requestedScopes: Scope[],
 ): number {
+  // A planner is orientation, never an action: even one advertising the exact
+  // paths in this request holds nothing to coordinate over. Ranked below
+  // everything so it can never push a real blocker past the output cap.
+  if (peer.state === "planning") return 5;
   if (peerOverlapsRequestedScopes(peer, request, requestedScopes)) return 0;
   if (isSameBranchPeer(peer, request)) return 1;
   if (peer.relation === "same_worktree") return 2;
@@ -1017,6 +1070,11 @@ function statusMessage(
   retryAtMs: number | null,
   nowMs: number,
 ): string {
+  if (status === "granted" && state === "planning") {
+    return grantedCount === 0
+      ? "Planning announced; no paths advertised and no claims held. Re-announce as working before you edit"
+      : `Planning announced; ${grantedCount} path${grantedCount === 1 ? " is" : "s are"} advertised but not claimed, so peers can edit them. Re-announce as working before you edit`;
+  }
   if (status === "granted" && state === "testing") {
     return grantedCount === 0
       ? "Testing announced; no paths advertised and no claims held"
@@ -1120,6 +1178,21 @@ function initializeSchema(database: Database): void {
       "testing",
       "INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1))",
     );
+    // "planning" follows the same precedent, and needs it just as much: the
+    // state ships to machines already running v2 sessions, and a planner's
+    // whole point is that it holds nothing worth interrupting them for.
+    addColumnIfMissing(
+      database,
+      "leases",
+      "planning",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (planning IN (0, 1))",
+    );
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "planning",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (planning IN (0, 1))",
+    );
     // "stopped" follows the testing precedent exactly: a terminal state
     // carried as an additive flag beside agent_state "done" rather than a
     // widened CHECK. It only ever describes events (a stopped lease is
@@ -1193,6 +1266,7 @@ CREATE TABLE IF NOT EXISTS leases (
   agent_state TEXT NOT NULL DEFAULT 'working'
     CHECK (agent_state IN ('working', 'done')),
   testing INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1)),
+  planning INTEGER NOT NULL DEFAULT 0 CHECK (planning IN (0, 1)),
   summary TEXT NOT NULL,
   emoji TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH}),
   project_id TEXT NOT NULL,
@@ -1239,6 +1313,7 @@ CREATE TABLE IF NOT EXISTS activity_events (
   agent_state TEXT NOT NULL DEFAULT 'working'
     CHECK (agent_state IN ('working', 'done')),
   testing INTEGER NOT NULL DEFAULT 0 CHECK (testing IN (0, 1)),
+  planning INTEGER NOT NULL DEFAULT 0 CHECK (planning IN (0, 1)),
   stopped INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1)),
   reason TEXT CHECK (reason IS NULL OR length(reason) <= 200),
   summary TEXT NOT NULL,

@@ -615,6 +615,169 @@ describe("AgentFrequencyStore.announce", () => {
     expect(event).toEqual({ agent_state: "working", testing: 1 });
   });
 
+  test("planning advertises paths without claiming them, and is capped to 15m", () => {
+    const { store, dbPath } = createStoreWithPath();
+    const planning = store.announce(
+      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
+        state: "planning",
+        summary: "Working out how token refresh should change",
+        timebox: "2h",
+      }),
+    );
+
+    expect(planning.status).toBe("granted");
+    expect(planning.self).toMatchObject({
+      state: "planning",
+      // Exclusive is downgraded rather than rejected, like testing.
+      granted_scopes: [{ path: "src/auth", access: "shared" }],
+      blocked_scopes: [],
+      // The echoed timebox is the effective one, not the requested one.
+      timebox: "15m",
+    });
+    expect(planning.self.expires_at).toBe(new Date(1_800_000_000_000 + 15 * 60_000).toISOString());
+    expect(planning.message).toContain("Re-announce as working before you edit");
+
+    // An editor arriving next takes its exclusive claim with no interference.
+    const editor = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+    expect(editor.status).toBe("granted");
+    expect(editor.self.blocked_scopes).toEqual([]);
+    expect(editor.peers.find((peer) => peer.agent_id === "alpha")).toMatchObject({
+      state: "planning",
+      scopes: [{ path: "src/auth", access: "shared" }],
+    });
+
+    const database = new Database(dbPath, { readonly: true });
+    const event = database
+      .query(
+        `SELECT agent_state, testing, planning FROM activity_events
+         WHERE agent_id = 'alpha' ORDER BY event_id DESC LIMIT 1`,
+      )
+      .get() as Record<string, unknown>;
+    database.close(false);
+    // Storage keeps the v2 agent_state values and carries planning additively.
+    expect(event).toEqual({ agent_state: "working", testing: 0, planning: 1 });
+  });
+
+  test("a planner is neither blocked by nor a warning to the agents around it", () => {
+    const store = createStore();
+    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    store.announce(
+      request("tester", [{ path: "src/billing", access: "shared" }], {
+        state: "testing",
+        nowMs: 1_800_000_000_500,
+      }),
+    );
+
+    // Reading exactly where alpha holds an exclusive claim and where tester is
+    // verifying: a planner edits nothing, so neither is its problem.
+    const planner = store.announce(
+      request(
+        "scout",
+        [
+          { path: "src/auth", access: "exclusive" },
+          { path: "src/billing", access: "shared" },
+        ],
+        { state: "planning", nowMs: 1_800_000_001_000 },
+      ),
+    );
+    expect(planner.status).toBe("granted");
+    expect(planner.self.blocked_scopes).toEqual([]);
+    expect(planner.warnings.map((warning) => warning.code)).not.toContain("SHARED_SCOPE_OVERLAP");
+    expect(planner.warnings.map((warning) => warning.code)).not.toContain("TESTING_SCOPE_OVERLAP");
+    // Presence warnings still reach the planner: that traffic is the reason to
+    // announce this early at all.
+    expect(planner.warnings.map((warning) => warning.code)).toContain("SAME_WORKTREE");
+
+    // ...and in the other direction the planner raises nothing at all.
+    const editor = store.announce(
+      request("bravo", [{ path: "src/reports", access: "exclusive" }], {
+        nowMs: 1_800_000_002_000,
+        metadata: metadata({ worktreeId: "worktree-2", worktreeRoot: "/code/example-bravo" }),
+      }),
+    );
+    expect(editor.status).toBe("granted");
+    expect(editor.warnings.find((warning) => warning.code === "SAME_BRANCH")?.message)
+      .toBe("Agents on branch main: alpha, tester");
+    expect(editor.peers.map((peer) => peer.agent_id)).toContain("scout");
+  });
+
+  test("planning peers sort last so they cannot bury an actionable one", () => {
+    const store = createStore();
+    for (let index = 0; index < 3; index += 1) {
+      store.announce(
+        request(`planner-${index}`, [{ path: "src/auth", access: "shared" }], {
+          state: "planning",
+          nowMs: 1_800_000_001_000 + index,
+        }),
+      );
+    }
+    store.announce(
+      request("blocker", [{ path: "src/auth", access: "exclusive" }], {
+        nowMs: 1_800_000_000_000,
+      }),
+    );
+
+    const caller = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+        nowMs: 1_800_000_002_000,
+      }),
+    );
+    expect(caller.status).toBe("blocked");
+    // Every planner is newer, and each advertises the requested path; ranking
+    // still puts the one agent this caller has to coordinate with first.
+    expect(caller.peers[0]?.agent_id).toBe("blocker");
+  });
+
+  test("an exclusive claim still blocks when a stale planning flag survives a renewal", () => {
+    const { store, dbPath } = createStoreWithPath();
+    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    // An MCP process built before this state renews a lease without knowing the
+    // flag column exists: real exclusive claims, stale planning = 1.
+    const database = new Database(dbPath, { strict: true });
+    database.exec("UPDATE leases SET planning = 1 WHERE agent_id = 'alpha'");
+    database.close(false);
+
+    const peer = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+
+    expect(peer.status).toBe("blocked");
+    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
+  });
+
+  test("announcing working after planning takes the exclusive claim for real", () => {
+    const store = createStore();
+    const plan = store.announce(
+      request("alpha", [{ path: "src/auth", access: "exclusive" }], { state: "planning" }),
+    );
+
+    const editing = store.announce(
+      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
+        summary: "Rewriting token refresh",
+        leaseId: plan.self.lease_id!,
+        timebox: "1h",
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+    expect(editing.self.granted_scopes).toEqual([{ path: "src/auth", access: "exclusive" }]);
+    // The planning cap lifts with the state that imposed it.
+    expect(editing.self.timebox).toBe("1h");
+
+    const peer = store.announce(
+      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
+        nowMs: 1_800_000_002_000,
+      }),
+    );
+    expect(peer.status).toBe("blocked");
+    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
+  });
+
   test("an exclusive claim still blocks when a stale testing flag survives a renewal", () => {
     const { store, dbPath } = createStoreWithPath();
     store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
@@ -1208,6 +1371,39 @@ describe("recent peers", () => {
     );
     expect(completion.status).toBe("completed");
     expect(completion.recent_peers).toHaveLength(0);
+  });
+
+  test("an agent that only ever planned leaves no trace in recent peers", () => {
+    const store = createStore();
+    // Its lease lapses without a word, which for an editor would report
+    // "expired" — the signal that says changes here may be half-done.
+    store.announce(request("scout", [], { state: "planning", nowMs: T }));
+
+    const observer = store.announce(request("beta", [], { nowMs: T + 30 * MINUTE }));
+    expect(observer.recent_peers).toHaveLength(0);
+  });
+
+  test("planning first does not hide an agent that went on to edit", () => {
+    const store = createStore();
+    const plan = store.announce(request("scout", [], { state: "planning", nowMs: T }));
+    store.announce(
+      request("scout", [{ path: "src/auth", access: "exclusive" }], {
+        leaseId: plan.self.lease_id ?? undefined,
+        nowMs: T + MINUTE,
+      }),
+    );
+    // Back to planning after a chunk of work, then gone: the edits are still
+    // out there, so this agent still owes the next one an explanation.
+    store.announce(
+      request("scout", [], {
+        state: "planning",
+        leaseId: plan.self.lease_id ?? undefined,
+        nowMs: T + 2 * MINUTE,
+      }),
+    );
+
+    const observer = store.announce(request("beta", [], { nowMs: T + 30 * MINUTE }));
+    expect(observer.recent_peers).toMatchObject([{ agent_id: "scout", outcome: "expired" }]);
   });
 
   test("the orientation window is bounded and the list capped, newest first", () => {

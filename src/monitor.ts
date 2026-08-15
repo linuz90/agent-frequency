@@ -631,6 +631,9 @@ function readEvents(
     const testingColumn = hasColumn(database, "activity_events", "testing")
       ? "testing"
       : "0 AS testing";
+    const planningColumn = hasColumn(database, "activity_events", "planning")
+      ? "planning"
+      : "0 AS planning";
     const stoppedColumn = hasColumn(database, "activity_events", "stopped")
       ? "stopped"
       : "0 AS stopped";
@@ -645,7 +648,7 @@ function readEvents(
       : "NULL AS emoji";
     const rows = database
       .query(
-        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${stoppedColumn}, ${reasonColumn}, summary, ${emojiColumn},
+        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${planningColumn}, ${stoppedColumn}, ${reasonColumn}, summary, ${emojiColumn},
                 repo_name, worktree_root, branch, requested_scope_count,
                 granted_scope_count, blocked_scope_count, ${blockersColumn}, peer_count, created_at_ms,
                 count(*) OVER () AS total_count
@@ -679,7 +682,11 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
     agent_id: toText(row.agent_id),
     agent_label: toText(row.agent_label),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: agentStateFromRow(row.agent_state, row.testing, row.stopped),
+    agent_state: agentStateFromRow(row.agent_state, {
+      testing: row.testing,
+      stopped: row.stopped,
+      planning: row.planning,
+    }),
     summary: toText(row.summary),
     reason: toNullableText(row.reason),
     emoji: sanitizeEmoji(row.emoji),
@@ -782,7 +789,11 @@ function toLease(
     agent_id: toText(row.agent_id),
     agent_label: toText(row.agent_label),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: agentStateFromLease(row.agent_state, row.testing, claims),
+    agent_state: agentStateFromLease(
+      row.agent_state,
+      { testing: row.testing, planning: row.planning },
+      claims,
+    ),
     summary: toText(row.summary),
     // Older MCP processes predate the column, so the row may not carry it.
     emoji: sanitizeEmoji(row.emoji),

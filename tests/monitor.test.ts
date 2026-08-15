@@ -468,6 +468,35 @@ describe("monitor", () => {
     expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
   });
 
+  test("reports the additive planning flag as a planning agent state", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const database = new Database(dbPath, { strict: true });
+    // Same additive upgrade as testing: v2 agent_state is untouched and
+    // "planning" arrives beside it.
+    database.exec("ALTER TABLE leases ADD COLUMN planning INTEGER NOT NULL DEFAULT 0");
+    database.exec("ALTER TABLE activity_events ADD COLUMN planning INTEGER NOT NULL DEFAULT 0");
+    database.exec("UPDATE leases SET planning = 1 WHERE agent_id = 'alpha'");
+    database.exec("UPDATE activity_events SET planning = 1 WHERE agent_id = 'alpha'");
+    // A planner claims nothing, so its advertised paths are shared.
+    database.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
+    database.close(false);
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    expect(state.leases[0]?.agent_state).toBe("planning");
+    expect(state.events.map((event) => event.agent_state)).toEqual(["done", "planning", "working"]);
+
+    // As with testing, an older process renewing that lease writes real claims
+    // without touching the flag, and the claims are what count.
+    const stale = new Database(dbPath, { strict: true });
+    stale.exec(
+      "UPDATE claims SET access = 'exclusive' WHERE lease_id = 'lease-active' AND path = 'src/auth/token.ts'",
+    );
+    stale.close(false);
+    expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
+  });
+
   test("reports the additive stopped flag with its reason, and recorded blockers", async () => {
     const dbPath = temporaryDatabasePath();
     seedDatabase(dbPath, Date.now());
@@ -607,14 +636,21 @@ describe("monitor", () => {
     expect(html).toContain("function waitingText(blockers)");
     expect(html).toContain('el("div", "waiting-note")');
     expect(html).toContain('task.outcome === "stopped"');
-    // A testing agent is live but holds nothing, so its card must say so
-    // instead of reading like an ordinary set of claims.
+    // A testing or planning agent is live but holds nothing, so its card must
+    // say so instead of reading like an ordinary set of claims.
     expect(html).toContain('var testing = lease.agent_state === "testing"');
-    expect(html).toContain('meta.appendChild(el("span", "agent-state", "testing"))');
+    expect(html).toContain('var planning = lease.agent_state === "planning"');
+    expect(html).toContain('meta.appendChild(el("span", "agent-state", lease.agent_state))');
     expect(html).toContain('el("span", null, "not blocking")');
-    expect(html).toContain('testing ? "Scopes under test" : "Claimed scopes"');
+    expect(html).toContain('planning ? "Areas being read" : testing ? "Scopes under test" : "Claimed scopes"');
     expect(html).toContain('if (event.agent_state === "testing") return "verifying, claims released"');
+    expect(html).toContain('if (event.agent_state === "planning") return "planning, nothing claimed"');
     expect(html).toContain('? "started testing"');
+    expect(html).toContain('? "started planning"');
+    // A session that only ever planned and then went quiet changed nothing,
+    // so it must not be rolled up as recent work.
+    expect(html).toContain('if (event.agent_state !== "planning") task.edited = true');
+    expect(html).toContain('return task.edited || task.outcome !== "expired"');
     expect(html).toContain(
       'id="project-filter-select" aria-label="Filter agents by project or machine"',
     );
@@ -640,7 +676,7 @@ describe("monitor", () => {
     expect(html).toContain("function groupTasksByRepo(tasks)");
     expect(html).toContain('el("summary", "recent-label", "Recent")');
     expect(html).toContain("list.length < MAX_PROJECT_RECENT_TASKS");
-    expect(html).toContain("task.ended_at_ms >= cutoff");
+    expect(html).toContain("if (task.ended_at_ms < cutoff) return false");
     // Finished work stays collapsed under live agents so it can never push
     // another project's running work below the fold, and a section with
     // nothing but recent tasks still opens.

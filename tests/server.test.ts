@@ -45,6 +45,31 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   // ambient presence into noise in reports.
   expect(instructions).toContain("not material for your reports");
 
+  // Planning crosses the process boundary as pure advertisement: the same
+  // exclusive request that blocks a peer below is downgraded, capped to the
+  // shortest timebox, and left arbitrating nothing.
+  const planning = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Read the flight plan before changing it",
+      emoji: "🗺️",
+      cwd: directory,
+      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+      timebox: "2h",
+      state: "planning",
+    },
+  });
+  const planningOutput = planning.structuredContent as Record<string, unknown> | undefined;
+  expect(planning.isError).not.toBeTrue();
+  expect(planningOutput?.status).toBe("granted");
+  expect(planningOutput?.self).toMatchObject({
+    active: true,
+    state: "planning",
+    granted_scopes: [{ path: "flight-plan.txt", access: "shared" }],
+    blocked_scopes: [],
+    timebox: "15m",
+  });
+
   const first = await codex.callTool({
     name: "announce",
     arguments: {
@@ -75,6 +100,14 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(firstOutput?.status).toBe("granted");
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.surface).toBe("cli");
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.emoji).toBe("🐛");
+  // Codex takes the exclusive claim straight through the planner, and hears
+  // about it without being warned: a planner is visible traffic, never a risk.
+  expect((firstOutput?.self as Record<string, unknown> | undefined)?.blocked_scopes).toEqual([]);
+  expect(firstOutput?.warnings).toEqual([]);
+  expect((firstOutput?.peers as Array<Record<string, unknown>>)[0]).toMatchObject({
+    state: "planning",
+    emoji: "🗺️",
+  });
   expect(second.isError).not.toBeTrue();
   expect(secondOutput?.status).toBe("blocked");
   expect(secondOutput?.peers).toBeArrayOfSize(1);
@@ -264,23 +297,25 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const database = new Database(dbPath, { readonly: true });
   const events = database
     .query(
-      "SELECT status, client_surface, agent_state, testing, stopped, reason FROM activity_events ORDER BY event_id ASC",
+      "SELECT status, client_surface, agent_state, testing, planning, stopped, reason FROM activity_events ORDER BY event_id ASC",
     )
     .all() as Array<{
       status: string;
       client_surface: string;
       agent_state: string;
       testing: number;
+      planning: number;
       stopped: number;
       reason: string | null;
     }>;
   database.close(false);
-  // The testing and stopped announcements store the v2 states plus additive
-  // flags, so an older process reading these rows still parses them. The
-  // reasonless stop above failed validation before reaching the store, so it
-  // must not appear here at all.
-  const plain = { testing: 0, stopped: 0, reason: null };
+  // The planning, testing, and stopped announcements store the v2 states plus
+  // additive flags, so an older process reading these rows still parses them.
+  // The reasonless stop above failed validation before reaching the store, so
+  // it must not appear here at all.
+  const plain = { testing: 0, planning: 0, stopped: 0, reason: null };
   expect(events).toEqual([
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain, planning: 1 },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
     { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
@@ -295,6 +330,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       client_surface: "cli",
       agent_state: "done",
       testing: 0,
+      planning: 0,
       stopped: 1,
       reason: "waiting on user: approve the new wording",
     },

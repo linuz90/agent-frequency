@@ -7,7 +7,7 @@ export const TIMEBOX_SECONDS = {
   "2h": 2 * 60 * 60,
 } as const;
 
-export const AGENT_STATES = ["working", "testing", "done", "stopped"] as const;
+export const AGENT_STATES = ["planning", "working", "testing", "done", "stopped"] as const;
 export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
 
 export type Timebox = keyof typeof TIMEBOX_SECONDS;
@@ -15,37 +15,66 @@ export type Access = "shared" | "exclusive";
 export type AgentState = (typeof AGENT_STATES)[number];
 export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
 
+// Planning is bounded to the shortest bucket no matter what the caller asks
+// for. A planner holds no claims, so a lease outliving its session costs
+// nothing but a stale card — and the board is the reason the state exists.
+// Renewing is the honest "still planning" signal.
+export const PLANNING_TIMEBOX: Timebox = "15m";
+
+/** The states whose paths are advertisement rather than a claim to respect. */
+export function isAdvisoryState(state: AgentState): boolean {
+  return state === "planning" || state === "testing";
+}
+
 export function normalizeAgentState(value: unknown): AgentState {
   if (value === "done") return "done";
   if (value === "stopped") return "stopped";
+  if (value === "planning") return "planning";
   return value === "testing" ? "testing" : "working";
 }
 
 /**
- * Storage keeps the two v2 `agent_state` values and carries "testing" and
- * "stopped" in additive flag columns, so every read has to combine them. See
- * the schema comment in store.ts for why neither became a new enum value.
- * "stopped" wins: it is terminal, so no honest row sets both flags.
+ * The additive flag columns that ride beside `agent_state`. Named rather than
+ * positional because they keep accruing: a fourth boolean in a row of `unknown`
+ * arguments is a silent-misordering bug waiting to happen.
  */
-export function agentStateFromRow(state: unknown, testing: unknown, stopped?: unknown): AgentState {
-  if (stopped) return "stopped";
-  return testing ? "testing" : normalizeAgentState(state);
+export interface AgentStateFlags {
+  testing?: unknown;
+  stopped?: unknown;
+  planning?: unknown;
 }
 
 /**
- * A lease's state, cross-checked against the claims it holds. Testing releases
- * every exclusive claim, so a lease still holding one is being edited: an
- * older process renewing that lease writes real claims without knowing the
- * flag column exists, which would otherwise leave a stale "testing" behind and
- * quietly turn a genuine exclusive claim into an advisory one.
+ * Storage keeps the two v2 `agent_state` values and carries "testing",
+ * "stopped", and "planning" in additive flag columns, so every read has to
+ * combine them. See the schema comment in store.ts for why none became a new
+ * enum value. Precedence runs terminal, then the most active live phase: no
+ * honest row sets two flags, and preferring activity keeps a confused row from
+ * understating what an agent is doing.
+ */
+export function agentStateFromRow(state: unknown, flags: AgentStateFlags): AgentState {
+  if (flags.stopped) return "stopped";
+  if (flags.testing) return "testing";
+  if (flags.planning) return "planning";
+  return normalizeAgentState(state);
+}
+
+/**
+ * A lease's state, cross-checked against the claims it holds. Neither testing
+ * nor planning keeps an exclusive claim, so a lease still holding one is being
+ * edited: an older process renewing that lease writes real claims without
+ * knowing the flag column exists, which would otherwise leave a stale advisory
+ * state behind and quietly turn a genuine exclusive claim into an advisory one.
+ * Shared claims cannot be cross-checked this way — an advisory lease holds
+ * those legitimately — so that narrow rollout window is accepted.
  */
 export function agentStateFromLease(
   state: unknown,
-  testing: unknown,
+  flags: AgentStateFlags,
   claims: ReadonlyArray<{ access: Access }>,
 ): AgentState {
-  const resolved = agentStateFromRow(state, testing);
-  if (resolved === "testing" && claims.some((claim) => claim.access === "exclusive")) {
+  const resolved = agentStateFromRow(state, { testing: flags.testing, planning: flags.planning });
+  if (isAdvisoryState(resolved) && claims.some((claim) => claim.access === "exclusive")) {
     return "working";
   }
   return resolved;
@@ -140,6 +169,8 @@ export interface CoordinationWarning {
 // A recently departed agent, reconstructed from the bounded activity feed.
 // Display-only context: arbitration never reads these, and unlike Peer there
 // are no claims to respect — the lease behind this entry is already gone.
+// Agents that only ever planned in a worktree are left out: they edited
+// nothing, so they answer neither question this list is for.
 export interface RecentPeer {
   agent_id: string;
   label: string;
