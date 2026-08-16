@@ -20,12 +20,14 @@ Hand this to any coding agent:
 
 ```text
 Set up https://github.com/linuz90/agent-frequency on this machine by following its
-README: clone it somewhere permanent, run ./bin/agent-frequency-install, and add the
-login service from the "Keeping it running" section. Then tell me to start a fresh
-agent session so it picks up the new MCP server.
+README: clone it where I usually keep repos (ask me if in doubt), run
+./bin/agent-frequency-install, and add the login service from the "Keeping it
+running" section. Then add a line to my global agent instructions (AGENTS.md,
+CLAUDE.md, or this client's equivalent), following their existing conventions:
+"Announce your work with the agent-frequency MCP to coordinate with other agents."
 ```
 
-Prefer to do it yourself? See [Install](#install).
+The global-instructions line matters: some clients load MCP servers lazily, so that one sentence is what guarantees every agent discovers the frequency. [Install](#install) explains, and covers doing it all yourself.
 
 ## How it works
 
@@ -77,26 +79,21 @@ cd agent-frequency
 ./bin/agent-frequency-install
 ```
 
-That's the whole setup. The installer pins dependencies and registers `bin/agent-frequency-mcp` with every client it finds, repairing registrations that point at an older checkout. Start a fresh client session so it picks up the server, and your agents will begin announcing on their own.
+That's the whole install. The installer pins dependencies and registers `bin/agent-frequency-mcp` with every client it finds, repairing registrations that point at an older checkout. Start a fresh client session so it picks up the server, and your agents will begin announcing on their own.
 
 They do that unprompted because the server ships its standing directive in the MCP [`instructions`](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) field, which clients surface once per session. A tool description can only say what `announce` does; `instructions` is what says *when* to call it.
+
+One more line finishes the job. Add this to your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or your client's equivalent):
+
+> Announce your work with the agent-frequency MCP to coordinate with other agents.
+
+Do it even if your client surfaces `instructions`: some clients load MCP servers lazily or drop the field entirely, and this line is what makes every agent reliably reach for the tool. From there, the `announce` description itself teaches the full protocol.
 
 Verify the registration anytime:
 
 ```bash
 ./bin/agent-frequency-install --check
 ```
-
-<details>
-<summary>Fallback: clients that ignore <code>instructions</code></summary>
-
-Host behavior is implementation-defined, and some clients drop the field. If yours does, paste the equivalent into your global agent instructions (`AGENTS.md`, `CLAUDE.md`, or the client's equivalent):
-
-> Before editing in a Git repository, call Agent Frequency's `announce` tool with `state: "working"`, a concise summary, the current working directory, narrow expected scopes, and a fixed timebox. While still investigating or designing a change you have not started, announce `state: "planning"` first with the areas you are reading; it claims nothing and blocks nobody. Respect blocked scopes. Re-announce with the returned `lease_id` when scope changes and before commit or push, and with `state: "testing"` while you are only verifying finished edits. After finishing, announce `state: "done"` with that `lease_id` to release the claims immediately; make that call just before your closing summary, so the traffic it returns is fresh enough to act on. If the run ends without finishing (stopping to ask the user something, giving up, or parking the work), announce `state: "stopped"` with a short `reason` instead; never announce done for unfinished work. Peer traffic is context for your decisions, not material for your reports: mention it only when it changed the work.
-
-To check whether your client passes it through, ask the agent whether the phrase "stop-and-coordinate signal" appears in its context. If it does, the instructions arrived.
-
-</details>
 
 ## The `announce` tool
 
