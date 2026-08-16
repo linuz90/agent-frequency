@@ -253,6 +253,15 @@ configure_mac_service() {
   # a false left side would make the whole list fail and abort the installer.
   if service_loaded; then
     launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 || true
+    # bootout returns before launchd finishes tearing the job down, and
+    # bootstrapping into that window fails with "Bootstrap failed: 5: Input/output
+    # error". Reinstalling over a loaded service is the normal case, so wait for
+    # the label to disappear rather than letting every re-run fail.
+    local settled=0
+    while [ "$settled" -lt 20 ] && service_loaded; do
+      sleep 0.5
+      settled=$((settled + 1))
+    done
   fi
   if ! launchctl bootstrap "gui/$(id -u)" "$SERVICE_PLIST"; then
     printf 'Agent Frequency: launchctl could not load %s.\n' "$SERVICE_PLIST" >&2
