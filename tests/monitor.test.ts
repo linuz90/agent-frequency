@@ -917,6 +917,68 @@ describe("monitor", () => {
     expect(JSON.stringify(state)).not.toContain("lease-active");
   });
 
+  test("answers a peer-marked request from local state without fetching peers", async () => {
+    let peerRequests = 0;
+    const peerUrl = startFakePeer(() => {
+      peerRequests += 1;
+      return Response.json({});
+    });
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const monitor = startTestMonitor(dbPath, { peers: [peerUrl] });
+
+    const response = await fetch(`${monitor.url}api/state?peer=1`);
+    expect(response.status).toBe(200);
+    const state = (await response.json()) as MonitorState;
+
+    expect(state.agent_count).toBe(1);
+    expect(state.peers).toEqual([]);
+    expect(peerRequests).toBe(0);
+  });
+
+  test("marks outbound peer fetches so the remote skips its own aggregation", async () => {
+    let requestedUrl = "";
+    const peerUrl = startFakePeer((request) => {
+      requestedUrl = request.url;
+      return Response.json({});
+    });
+
+    const monitor = startTestMonitor(temporaryDatabasePath(), { peers: [peerUrl] });
+    await fetchState(monitor);
+
+    expect(new URL(requestedUrl).searchParams.get("peer")).toBe("1");
+  });
+
+  test("keeps mutually peered monitors reachable instead of recursing", async () => {
+    // Reserve two real ports the way the unreachable-peer test does, so each
+    // monitor can be told about the other before either of them starts.
+    const firstUrl = startFakePeer(() => new Response("reserved"));
+    const secondUrl = startFakePeer(() => new Response("reserved"));
+    const firstPort = Number(new URL(firstUrl).port);
+    const secondPort = Number(new URL(secondUrl).port);
+    await fakePeerServers.pop()?.stop(true);
+    await fakePeerServers.pop()?.stop(true);
+
+    const firstDbPath = temporaryDatabasePath();
+    seedDatabase(firstDbPath, Date.now());
+    startTestMonitor(firstDbPath, { port: firstPort, peers: [secondUrl], peerTimeoutMs: 1_000 });
+    const second = startTestMonitor(temporaryDatabasePath(), {
+      port: secondPort,
+      peers: [firstUrl],
+      peerTimeoutMs: 1_000,
+    });
+
+    const startedAt = Date.now();
+    const state = await fetchState(second);
+
+    // Answering the other side's fetch from local state is what keeps this under
+    // the timeout; recursing floors every response at peerTimeoutMs, so both
+    // monitors would report each other as timed out.
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(state.peers[0]?.reachable).toBeTrue();
+    expect(state.peers[0]?.snapshot?.agent_count).toBe(1);
+  });
+
   test("carries a testing agent on another machine through federation", async () => {
     const peerDbPath = temporaryDatabasePath();
     seedDatabase(peerDbPath, Date.now());

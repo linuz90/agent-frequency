@@ -30,6 +30,14 @@ const HOSTNAME = "127.0.0.1";
 // loopback-bound, and peer data never reaches announce arbitration.
 const MAX_PEERS = 8;
 const DEFAULT_PEER_TIMEOUT_MS = 1_500;
+// Marks a request as coming from another monitor, so the response is built from
+// local state alone. Without it, two monitors listing each other recurse: every
+// /api/state fetch triggers a reciprocal fetch, so each response takes at least
+// the peer timeout, which is precisely what makes the caller time out and report
+// the peer unreachable. A mutual pair is the normal setup for two machines, so
+// enforce the documented one-level-deep read here instead of trusting operators
+// to configure peering in only one direction.
+const PEER_REQUEST_PARAM = "peer";
 const MAX_PEER_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PEER_LEASES = 200;
 const MAX_PEER_CLAIMS = 64;
@@ -159,7 +167,7 @@ export function startMonitor(options: MonitorOptions = {}): MonitorHandle {
     hostname: HOSTNAME,
     port: options.port ?? DEFAULT_PORT,
     async fetch(request) {
-      const { pathname, hostname } = new URL(request.url);
+      const { pathname, hostname, searchParams } = new URL(request.url);
       // Loopback binding alone does not stop DNS rebinding: a hostile page can
       // rebind its own hostname to 127.0.0.1 and read /api/state cross-origin.
       // Accept only loopback Hosts plus tailnet hostnames, which Tailscale
@@ -181,7 +189,11 @@ export function startMonitor(options: MonitorOptions = {}): MonitorHandle {
         });
       }
       if (pathname === "/api/state" || pathname === "/agents/api/state") {
-        return Response.json(await readFederatedState(dbPath, peers, Date.now(), peerTimeoutMs), {
+        const forPeer = searchParams.get(PEER_REQUEST_PARAM) === "1";
+        const state = forPeer
+          ? { ...readState(dbPath, Date.now()), peers: [] }
+          : await readFederatedState(dbPath, peers, Date.now(), peerTimeoutMs);
+        return Response.json(state, {
           headers: { ...baseHeaders(), [UI_VERSION_HEADER]: pageAsset().version },
         });
       }
@@ -410,7 +422,7 @@ async function fetchPeer(url: string, nowMs: number, timeoutMs: number): Promise
 
   let response: Response;
   try {
-    response = await fetch(`${url}/api/state`, {
+    response = await fetch(`${url}/api/state?${PEER_REQUEST_PARAM}=1`, {
       signal: AbortSignal.timeout(timeoutMs),
       // A redirect could silently swap the audited peer for another origin.
       redirect: "error",
