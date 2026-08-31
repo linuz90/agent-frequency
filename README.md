@@ -109,13 +109,13 @@ Verify the registration anytime:
 | `traffic_scope` | Peer detail breadth: `worktree` (default), `project`, or `machine`. |
 | `lease_id` | Handle from the previous response. Renews and replaces that lease. |
 
-**Claims.** `shared` scopes coexist with a warning; `exclusive` scopes block every overlapping incoming claim until they expire. Claims are advisory: blocked means coordinate before editing; nothing stops an uncooperative process from writing.
+**Claims.** The physical worktree is the arbitration boundary. Inside it, `shared` scopes coexist with a warning and `exclusive` scopes block every overlapping incoming claim until they expire. A matching claim in another worktree remains useful integration context, but never blocks or raises a path-overlap warning. Claims are advisory: blocked means coordinate before editing the shared checkout; nothing stops an uncooperative process from writing.
 
 **Status** is `granted` (all scopes published), `partial` (compatible scopes published, conflicting ones withheld), `blocked` (nothing published), `completed`, or `stopped` (both terminal: the lease and its claims were released; they differ only in whether the work finished).
 
 **The emoji is decoration**, never coordination input. Anything that is not exactly one emoji is dropped while the announcement still lands, so a model that sends a sentence loses the glyph, not the lease.
 
-**Peers** are classified `same_worktree`, `same_clone`, `same_project`, or `other_project`. Physical worktree identity beats remote heuristics, so an origin hiccup can never hide an agent editing the same files. `traffic_scope` filters what you *see*, never what is *checked*: arbitration always inspects every active peer in the project, and `hidden_peers` counts what was filtered out.
+**Peers** are classified `same_worktree`, `same_clone`, `same_project`, or `other_project`. Physical worktree identity beats remote heuristics, so an origin hiccup can never hide an agent editing the same files. `traffic_scope` filters what you *see*, never what can block: arbitration always stays inside the physical worktree, while `hidden_peers` counts context filtered from the response.
 
 Peers also expose their worktree's dirty paths, answering in one call a common reason agents stall: *"there are changes here I didn't make."* Ownership comes from each peer's `scopes` and `summary`; same-worktree peers all snapshot the same tree, so their `dirty_paths` are everyone's edits combined and serve only as corroboration.
 
@@ -123,7 +123,7 @@ Peers also expose their worktree's dirty paths, answering in one call a common r
 
 **Planning** is the phase before any edit: investigating, reading code, designing a change not yet started. Announcing it early is mostly self-interest: a plan built against a stale worktree is wasted work, and `working` arrives too late to prevent that. Planned paths are advertisements, not claims, and sit outside arbitration in both directions. A planner blocks nobody, is blocked by nobody, and raises no warnings, yet still *receives* every warning and the full peer list, the traffic that can still change a plan. The timebox is forced to `15m`, because a stale card is the only thing a planner can cost; a longer phase renews. Re-announce as `working` before the first edit.
 
-**Testing** is the phase after the last edit: only tests, builds, or other verification are running. `state: "testing"` keeps the lease live and the scopes visible but stops them blocking, so a waiting peer is unblocked at verification rather than at `done`. Overlapping callers get a `TESTING_SCOPE_OVERLAP` warning, since edits underneath a running verification can invalidate it, and the tester returns to `working` before touching files again.
+**Testing** is the phase after the last edit: only tests, builds, or other verification are running. `state: "testing"` keeps the lease live and the scopes visible but stops them blocking, so a waiting peer in the same worktree is unblocked at verification rather than at `done`. Same-worktree overlapping callers get a `TESTING_SCOPE_OVERLAP` warning, since edits underneath a running verification can invalidate it, and the tester returns to `working` before touching files again.
 
 **Stopping** is the honest ending for a run that did not finish: pausing to ask the user something, giving up, or parking the work. `state: "stopped"` requires a `reason` and releases the lease and claims exactly like `done` (blocking peers helps nobody once the run is over), but the record it leaves says the work is unfinished, so the next agent reads the leftover changes as half-done rather than completed.
 

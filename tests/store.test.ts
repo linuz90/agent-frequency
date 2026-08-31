@@ -78,11 +78,7 @@ describe("AgentFrequencyStore.announce", () => {
     store.announce(request("alpha", [{ path: "src/auth", access: "shared" }]));
 
     const result = store.announce(
-      request(
-        "bravo",
-        [{ path: "src/auth/token.ts", access: "shared" }],
-        { metadata: metadata({ worktreeId: "worktree-2", worktreeRoot: "/code/example-bravo" }) },
-      ),
+      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }]),
     );
 
     expect(result.status).toBe("granted");
@@ -127,6 +123,111 @@ describe("AgentFrequencyStore.announce", () => {
     expect(second.retry_at).toBe(first.self.expires_at!);
     expect(second.message).toContain("re-announce these scopes to retry");
     expect(JSON.stringify(second)).not.toContain(first.self.lease_id);
+  });
+
+  test("never arbitrates overlapping claims across physical worktrees", () => {
+    for (const [relation, trafficScope, peerMetadata] of [
+      [
+        "same_clone",
+        "worktree",
+        metadata({ worktreeId: "worktree-2", worktreeRoot: "/code/example-two" }),
+      ],
+      [
+        "same_project",
+        "project",
+        metadata({
+          localRepoId: "clone-2",
+          worktreeId: "worktree-3",
+          worktreeRoot: "/other/example",
+        }),
+      ],
+      [
+        "same_project",
+        "machine",
+        metadata({
+          localRepoId: "clone-3",
+          worktreeId: "worktree-4",
+          worktreeRoot: "/elsewhere/example",
+        }),
+      ],
+    ] as const) {
+      const store = createStore();
+      store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+
+      const result = store.announce(
+        request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+          metadata: peerMetadata,
+          trafficScope,
+        }),
+      );
+
+      expect(result.status).toBe("granted");
+      expect(result.self.granted_scopes).toEqual([
+        { path: "src/auth/token.ts", access: "exclusive" },
+      ]);
+      expect(result.self.blocked_scopes).toEqual([]);
+      expect(result.retry_at).toBeNull();
+      expect(result.peers).toMatchObject([
+        {
+          agent_id: "alpha",
+          relation,
+          scopes: [{ path: "src/auth", access: "exclusive" }],
+        },
+      ]);
+      expect(
+        result.warnings.some(
+          (warning) =>
+            warning.code === "SHARED_SCOPE_OVERLAP"
+            || warning.code === "TESTING_SCOPE_OVERLAP",
+        ),
+      ).toBeFalse();
+    }
+  });
+
+  test("never raises path-overlap warnings across physical worktrees", () => {
+    for (const [peerState, warningCode] of [
+      ["working", "SHARED_SCOPE_OVERLAP"],
+      ["testing", "TESTING_SCOPE_OVERLAP"],
+    ] as const) {
+      const store = createStore();
+      store.announce(
+        request("alpha", [{ path: "src/auth", access: "shared" }], { state: peerState }),
+      );
+
+      const result = store.announce(
+        request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
+          metadata: metadata({
+            worktreeId: "worktree-2",
+            worktreeRoot: "/code/example-two",
+            branch: "feature",
+          }),
+        }),
+      );
+
+      expect(result.status).toBe("granted");
+      expect(result.peers).toMatchObject([{ agent_id: "alpha", relation: "same_clone" }]);
+      expect(result.warnings.some((warning) => warning.code === warningCode)).toBeFalse();
+    }
+  });
+
+  test("reports missing dirty-file context without undermining worktree identity", () => {
+    const store = createStore();
+    const result = store.announce(
+      request("alpha", [], {
+        metadata: metadata({
+          dirty: null,
+          dirtyCount: null,
+          dirtyPaths: [],
+          metadataComplete: false,
+        }),
+      }),
+    );
+
+    expect(result.warnings.find((warning) => warning.code === "INCOMPLETE_GIT_METADATA"))
+      .toEqual({
+        code: "INCOMPLETE_GIT_METADATA",
+        message: "Git status is unavailable; dirty-file context may be incomplete",
+      });
   });
 
   test("retry_at reports the latest blocker expiry across blocked scopes", () => {
@@ -280,7 +381,7 @@ describe("AgentFrequencyStore.announce", () => {
     );
   });
 
-  test("defaults to actionable traffic and widens explicitly", () => {
+  test("defaults to relevant traffic and widens explicitly", () => {
     const store = createStore();
     store.announce(
       request("worktree-peer", [], {
@@ -345,7 +446,7 @@ describe("AgentFrequencyStore.announce", () => {
       other_project: 1,
     });
     expect(narrow.peers_truncated).toBe(0);
-    expect(narrow.warnings.some((warning) => warning.code === "SHARED_SCOPE_OVERLAP")).toBeTrue();
+    expect(narrow.warnings.some((warning) => warning.code === "SHARED_SCOPE_OVERLAP")).toBeFalse();
     expect(narrow.warnings.some((warning) => warning.code === "SAME_BRANCH")).toBeTrue();
 
     const project = store.announce(

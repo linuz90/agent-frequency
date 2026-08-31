@@ -31,6 +31,10 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const claude = await connectClient("Claude", dbPath);
   const tools = await codex.listTools();
   expect(tools.tools.map((tool) => tool.name)).toEqual(["announce"]);
+  expect(tools.tools[0]?.description).toContain(
+    "Claims arbitrate only inside one physical worktree",
+  );
+  expect(tools.tools[0]?.description).toContain("context, never a lock");
 
   // Delivered over a real handshake, because the standing "when to call this"
   // directive only reaches the model if the server actually populates it.
@@ -41,6 +45,8 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   // The completing call is also the caller's last read of the frequency, so the
   // directive has to say when to make it, not just that it releases claims.
   expect(instructions).toContain("closing summary");
+  expect(instructions).toContain("Claims arbitrate only inside one physical worktree");
+  expect(instructions).toContain("context, never a lock");
   // Agents otherwise narrate every peer they see back to the user, which turns
   // ambient presence into noise in reports.
   expect(instructions).toContain("not material for your reports");
@@ -116,6 +122,47 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect((secondOutput?.self as Record<string, unknown> | undefined)?.emoji).toBeNull();
   expect((secondOutput?.peers as Array<Record<string, unknown>>)[0]?.emoji).toBe("🐛");
   expect(secondOutput?.traffic_scope).toBe("worktree");
+
+  // The same repo-relative path in another worktree names different physical
+  // files. It remains visible as useful integration context, but cannot block.
+  const worktreeParent = mkdtempSync(join(tmpdir(), "agent-frequency-worktree-test-"));
+  temporaryDirectories.push(worktreeParent);
+  const worktreeDirectory = join(worktreeParent, "sibling");
+  git(directory, "worktree", "add", "-qb", "sibling", worktreeDirectory);
+  const crossWorktree = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Edit flight plan independently",
+      cwd: worktreeDirectory,
+      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+      timebox: "15m",
+    },
+  });
+  const crossWorktreeOutput = crossWorktree.structuredContent as Record<string, unknown>;
+  expect(crossWorktree.isError).not.toBeTrue();
+  expect(crossWorktreeOutput.status).toBe("granted");
+  expect(crossWorktreeOutput.self).toMatchObject({
+    blocked_scopes: [],
+    granted_scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+  });
+  expect(crossWorktreeOutput.peers).toMatchObject([
+    {
+      relation: "same_clone",
+      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+    },
+  ]);
+  expect(crossWorktreeOutput.retry_at).toBeNull();
+
+  const crossWorktreeCompletion = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Finished independent flight plan edit",
+      cwd: worktreeDirectory,
+      lease_id: (crossWorktreeOutput.self as Record<string, unknown>).lease_id,
+      state: "done",
+    },
+  });
+  expect(crossWorktreeCompletion.isError).not.toBeTrue();
 
   const unrelatedDirectory = mkdtempSync(join(tmpdir(), "agent-frequency-unrelated-test-"));
   temporaryDirectories.push(unrelatedDirectory);
@@ -318,6 +365,8 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain, planning: 1 },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
     { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    { status: "granted", client_surface: "cli", agent_state: "done", ...plain },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
     { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
     { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
