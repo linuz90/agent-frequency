@@ -123,7 +123,7 @@ export type HiddenPeerCounts = Record<PeerRelation, number>;
 
 export interface Blocker {
   agent_id: string;
-  relation: PeerRelation;
+  relation: "same_worktree";
   path: string;
   access: Access;
   expires_at: string;

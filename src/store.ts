@@ -544,9 +544,9 @@ export class AgentFrequencyStore {
 
     for (const peer of peers) {
       const relation = relationTo(peer, request);
-      // Unrelated projects belong in the traffic snapshot, but their paths
-      // describe a different namespace and must never block this project.
-      if (relation === "other_project") {
+      // Each worktree has its own working copy, so matching repo-relative paths
+      // elsewhere remain integration context but never arbitrate or warn here.
+      if (relation !== "same_worktree") {
         continue;
       }
       const peerClaims = claimsByLease.get(peer.lease_id) ?? [];
@@ -705,10 +705,8 @@ export class AgentFrequencyStore {
       return false;
     });
 
-    // Filtering is deliberately the final response-shaping step: every peer
-    // above already participated in arbitration and warnings. Within the hard
-    // output cap, actionable overlaps and same-branch risks outrank ambient
-    // traffic so narrowing the view cannot bury the reason coordination fired.
+    // Arbitration already considered same-worktree peers. Response shaping can
+    // still prioritize project-level path and branch context within the cap.
     visible.sort(
       (left, right) =>
         peerActionRank(left, request, requestedScopes)
@@ -803,14 +801,14 @@ export class AgentFrequencyStore {
     if (!request.metadata.metadataComplete) {
       warnings.push({
         code: "INCOMPLETE_GIT_METADATA",
-        message: "Git metadata is incomplete; collision detection may miss related worktrees or clones",
+        message: "Git status is unavailable; dirty-file context may be incomplete",
       });
     }
 
     if (requestedScopes.some((scope) => scope.path === "." && scope.access === "exclusive")) {
       warnings.push({
         code: "BROAD_EXCLUSIVE_SCOPE",
-        message: "An exclusive repository-wide scope can unnecessarily block unrelated work",
+        message: "An exclusive repository-wide scope can unnecessarily block unrelated work in this worktree",
       });
     }
 
