@@ -1,6 +1,7 @@
 import { sanitizeEmoji } from "./emoji";
 import { collectGitMetadata } from "./git";
 import { AgentFrequencyStore } from "./store";
+import { DEFAULT_TIMEBOX } from "./types";
 import type { ClientSurface } from "./client-surface";
 import type { AnnounceInput, AnnounceOutput } from "./types";
 
@@ -68,7 +69,7 @@ export async function coordinateAnnouncement(
       emoji: sanitizeEmoji(input.emoji),
       metadata,
       scopes: input.scopes ?? [],
-      timebox: input.timebox ?? "1h",
+      timebox: input.timebox ?? DEFAULT_TIMEBOX,
       leaseId: input.lease_id,
       nowMs: options.nowMs,
     });

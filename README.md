@@ -43,7 +43,7 @@ Agent Frequency is a local stdio MCP server exposing exactly one tool: `announce
     { "path": "src/auth/token.ts", "access": "exclusive" },
     { "path": "tests/auth", "access": "shared" }
   ],
-  "timebox": "1h"
+  "timebox": "5m"
 }
 ```
 
@@ -105,7 +105,7 @@ Verify the registration anytime:
 | `scopes` | Repo-relative files or directory prefixes, each `shared` or `exclusive`. `.` means the whole repo. |
 | `state` | `planning`, `working` (default), `testing`, `done`, or `stopped`. |
 | `reason` | Why the run is ending unfinished. Required with `state: "stopped"`, ignored otherwise. |
-| `timebox` | `15m`, `30m`, `1h` (default), or `2h`: how long the lease survives without a renewal, not a task budget; long tasks keep re-announcing. Forced to `15m` while planning. |
+| `timebox` | `5m` (default), `15m`, `30m`, `1h`, or `2h`: how long the lease survives without a renewal, not a task budget. Choose aggressively and err short; use a longer bucket only when one uninterrupted operation will prevent renewal before `renew_after`. Forced to `5m` while planning. |
 | `traffic_scope` | Peer detail breadth: `worktree` (default), `project`, or `machine`. |
 | `lease_id` | Handle from the previous response. Renews and replaces that lease. |
 
@@ -121,7 +121,7 @@ Peers also expose their worktree's dirty paths, answering in one call a common r
 
 **Recently heard.** When no active peer explains those changes, the culprit usually just left. `recent_peers` lists agents whose leases recently ended here: `completed`, `stopped` (with their `reason`; the changes may be half-done), or `expired` (a crash or abandoned session). Agents that only ever planned are left out; they edited nothing. It is orientation, not arbitration: entries carry a summary and an outcome but no claims, and the defaults (a 24h window for a fresh lease, the delta since your own previous announcement for renewals, five entries at most) keep it usually empty.
 
-**Planning** is the phase before any edit: investigating, reading code, designing a change not yet started. Announcing it early is mostly self-interest: a plan built against a stale worktree is wasted work, and `working` arrives too late to prevent that. Planned paths are advertisements, not claims, and sit outside arbitration in both directions. A planner blocks nobody, is blocked by nobody, and raises no warnings, yet still *receives* every warning and the full peer list, the traffic that can still change a plan. The timebox is forced to `15m`, because a stale card is the only thing a planner can cost; a longer phase renews. Re-announce as `working` before the first edit.
+**Planning** is the phase before any edit: investigating, reading code, designing a change not yet started. Announcing it early is mostly self-interest: a plan built against a stale worktree is wasted work, and `working` arrives too late to prevent that. Planned paths are advertisements, not claims, and sit outside arbitration in both directions. A planner blocks nobody, is blocked by nobody, and raises no warnings, yet still *receives* every warning and the full peer list, the traffic that can still change a plan. The timebox is forced to `5m`, because a stale card is the only thing a planner can cost; a longer phase renews. Re-announce as `working` before the first edit.
 
 **Testing** is the phase after the last edit: only tests, builds, or other verification are running. `state: "testing"` keeps the lease live and the scopes visible but stops them blocking, so a waiting peer in the same worktree is unblocked at verification rather than at `done`. Same-worktree overlapping callers get a `TESTING_SCOPE_OVERLAP` warning, since edits underneath a running verification can invalidate it, and the tester returns to `working` before touching files again.
 
@@ -129,7 +129,7 @@ Peers also expose their worktree's dirty paths, answering in one call a common r
 
 ### Leases
 
-Leases expire exactly at their timebox and are cleaned up lazily by later announcements. A `done` or `stopped` announcement deletes the lease and its claims atomically instead of waiting.
+Leases expire exactly at their timebox and are cleaned up lazily by later announcements. The default is `5m`: an active agent renews with its `lease_id` before `renew_after`, while a crashed agent stops blocking quickly. Timebox selection estimates the next check-in, not total task duration, and should be deliberately aggressive rather than conservative. Longer buckets remain available for uninterrupted operations that prevent a timely renewal. A `done` or `stopped` announcement deletes the lease and its claims atomically instead of waiting.
 
 One timing limitation is fundamental: of two simultaneous callers, the later sees the earlier, but the earlier learns nothing new until it announces again. The pre-commit and pre-push refresh covers that gap without a second tool.
 

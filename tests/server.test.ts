@@ -35,6 +35,9 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     "Claims arbitrate only inside one physical worktree",
   );
   expect(tools.tools[0]?.description).toContain("context, never a lock");
+  expect(tools.tools[0]?.description).toContain("default 5m");
+  expect(tools.tools[0]?.description).toContain("estimate aggressively");
+  expect(tools.tools[0]?.description).toContain("before renew_after");
 
   // Delivered over a real handshake, because the standing "when to call this"
   // directive only reaches the model if the server actually populates it.
@@ -47,6 +50,9 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(instructions).toContain("closing summary");
   expect(instructions).toContain("Claims arbitrate only inside one physical worktree");
   expect(instructions).toContain("context, never a lock");
+  expect(instructions).toContain("default 5m");
+  expect(instructions).toContain("Err short");
+  expect(instructions).toContain("before renew_after");
   // Agents otherwise narrate every peer they see back to the user, which turns
   // ambient presence into noise in reports.
   expect(instructions).toContain("not material for your reports");
@@ -73,7 +79,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     state: "planning",
     granted_scopes: [{ path: "flight-plan.txt", access: "shared" }],
     blocked_scopes: [],
-    timebox: "15m",
+    timebox: "5m",
   });
 
   const first = await codex.callTool({
@@ -83,7 +89,6 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       emoji: "🐛",
       cwd: directory,
       scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-      timebox: "15m",
     },
   });
   const second = await claude.callTool({
@@ -106,6 +111,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(firstOutput?.status).toBe("granted");
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.surface).toBe("cli");
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.emoji).toBe("🐛");
+  expect((firstOutput?.self as Record<string, unknown> | undefined)?.timebox).toBe("5m");
   // Codex takes the exclusive claim straight through the planner, and hears
   // about it without being warned: a planner is visible traffic, never a risk.
   expect((firstOutput?.self as Record<string, unknown> | undefined)?.blocked_scopes).toEqual([]);

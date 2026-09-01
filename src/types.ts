@@ -1,6 +1,7 @@
 import type { ClientSurface } from "./client-surface";
 
 export const TIMEBOX_SECONDS = {
+  "5m": 5 * 60,
   "15m": 15 * 60,
   "30m": 30 * 60,
   "1h": 60 * 60,
@@ -15,11 +16,15 @@ export type Access = "shared" | "exclusive";
 export type AgentState = (typeof AGENT_STATES)[number];
 export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
 
+// A lease is crash protection, not a task estimate. Healthy agents renew as
+// they report progress, so the shortest bucket minimizes stale blockers.
+export const DEFAULT_TIMEBOX: Timebox = "5m";
+
 // Planning is bounded to the shortest bucket no matter what the caller asks
 // for. A planner holds no claims, so a lease outliving its session costs
 // nothing but a stale card — and the board is the reason the state exists.
 // Renewing is the honest "still planning" signal.
-export const PLANNING_TIMEBOX: Timebox = "15m";
+export const PLANNING_TIMEBOX: Timebox = "5m";
 
 /** The states whose paths are advertisement rather than a claim to respect. */
 export function isAdvisoryState(state: AgentState): boolean {

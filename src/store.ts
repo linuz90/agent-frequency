@@ -277,7 +277,7 @@ export class AgentFrequencyStore {
           expires_at: toIso(expiresAtMs),
           renew_after: toIso(nowMs + Math.floor((timeboxSeconds * 1_000 * 2) / 3)),
           // The effective value, not the requested one: a planning caller that
-          // asked for two hours has to be able to see it got fifteen minutes.
+          // asked for two hours has to see it received the shortest bucket.
           timebox,
           repo: request.metadata.repoName,
           worktree: request.metadata.worktreeRoot,

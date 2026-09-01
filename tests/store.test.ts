@@ -570,12 +570,12 @@ describe("AgentFrequencyStore.announce", () => {
     expect(result.self.lease_id).not.toBe("00000000000000000000000000000000");
   });
 
-  test.each(["15m", "30m", "1h", "2h"] satisfies Timebox[])(
+  test.each(["5m", "15m", "30m", "1h", "2h"] satisfies Timebox[])(
     "uses the exact %s timebox",
     (timebox) => {
       const store = createStore();
       const nowMs = 1_800_000_000_000;
-      const seconds = { "15m": 900, "30m": 1_800, "1h": 3_600, "2h": 7_200 }[timebox];
+      const seconds = { "5m": 300, "15m": 900, "30m": 1_800, "1h": 3_600, "2h": 7_200 }[timebox];
       const result = store.announce(request("alpha", [], { nowMs, timebox }));
       expect(result.self.expires_at).toBe(new Date(nowMs + seconds * 1_000).toISOString());
     },
@@ -716,7 +716,7 @@ describe("AgentFrequencyStore.announce", () => {
     expect(event).toEqual({ agent_state: "working", testing: 1 });
   });
 
-  test("planning advertises paths without claiming them, and is capped to 15m", () => {
+  test("planning advertises paths without claiming them, and is capped to 5m", () => {
     const { store, dbPath } = createStoreWithPath();
     const planning = store.announce(
       request("alpha", [{ path: "src/auth", access: "exclusive" }], {
@@ -733,9 +733,9 @@ describe("AgentFrequencyStore.announce", () => {
       granted_scopes: [{ path: "src/auth", access: "shared" }],
       blocked_scopes: [],
       // The echoed timebox is the effective one, not the requested one.
-      timebox: "15m",
+      timebox: "5m",
     });
-    expect(planning.self.expires_at).toBe(new Date(1_800_000_000_000 + 15 * 60_000).toISOString());
+    expect(planning.self.expires_at).toBe(new Date(1_800_000_000_000 + 5 * 60_000).toISOString());
     expect(planning.message).toContain("Re-announce as working before you edit");
 
     // An editor arriving next takes its exclusive claim with no interference.

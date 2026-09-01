@@ -7,6 +7,7 @@ import type { ClientSurface } from "./client-surface";
 import { sanitizeReason, sanitizeSummary } from "./coordinate";
 import { sanitizeEmoji } from "./emoji";
 import { AgentFrequencyStore, defaultDatabasePath } from "./store";
+import { DEFAULT_TIMEBOX } from "./types";
 import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox } from "./types";
 
 /**
@@ -384,7 +385,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
       emoji: sanitizeEmoji(entry.emoji),
       metadata: demoMetadata(worktree, home),
       scopes: entry.scopes ?? [],
-      timebox: entry.timebox ?? "1h",
+      timebox: entry.timebox ?? DEFAULT_TIMEBOX,
       leaseId: entry.renew ? leaseIds.get(entry.agent) : undefined,
       nowMs: nowMs - entry.minutesAgo * 60_000,
     });
