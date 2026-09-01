@@ -723,6 +723,8 @@ describe("monitor", () => {
     // A lease outlives a crashed agent, so a long check-in gap is marked rather
     // than left for the reader to compute, and it is recomputed on the clock.
     expect(html).toContain("function staleAfterMs(lease)");
+    expect(html).toContain("if (!lease.timebox_seconds) return UNKNOWN_TIMEBOX_STALE_MS");
+    expect(html).toContain("return (lease.timebox_seconds * 1000) / 2");
     expect(html).toContain('trackTime(updated, "age", lease.updated_at_ms, staleAfterMs(lease))');
     expect(html).toContain('entry.node.classList.toggle("stale", stale)');
     expect(html).toContain("timeNodes.forEach(applyTime)");

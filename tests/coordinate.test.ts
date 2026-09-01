@@ -93,6 +93,23 @@ test("two announcements share Git-derived traffic and advisory claims", async ()
   ]);
 });
 
+test("omitted timebox uses the shortest lease", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-frequency-coordinate-timebox-test-"));
+  temporaryDirectories.push(directory);
+  git(directory, "init", "-q");
+
+  const nowMs = 1_800_000_000_000;
+  const result = await coordinateAnnouncement(
+    { summary: "Use the default lease", cwd: directory },
+    { agentId: "Codex A001", agentLabel: "Codex", clientSurface: "cli" },
+    { dbPath: join(directory, "agent-frequency.sqlite3"), nowMs },
+  );
+
+  expect(result.self.timebox).toBe("5m");
+  expect(result.self.expires_at).toBe(new Date(nowMs + 5 * 60_000).toISOString());
+  expect(result.self.renew_after).toBe(new Date(nowMs + 200_000).toISOString());
+});
+
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
     stdout: "ignore",

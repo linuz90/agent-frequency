@@ -262,12 +262,12 @@
 
   // A lease keeps ticking after the process holding it dies, so silence is
   // the first sign of a crashed agent. Half the declared timebox is the
-  // threshold, floored so a short lease is not called stale for a pause
-  // between ordinary calls.
-  var MIN_STALE_MS = 15 * 60 * 1000;
+  // threshold. Only legacy or remote rows missing a timebox use a fallback.
+  var UNKNOWN_TIMEBOX_STALE_MS = 15 * 60 * 1000;
 
   function staleAfterMs(lease) {
-    return Math.max(MIN_STALE_MS, ((lease.timebox_seconds || 0) * 1000) / 2);
+    if (!lease.timebox_seconds) return UNKNOWN_TIMEBOX_STALE_MS;
+    return (lease.timebox_seconds * 1000) / 2;
   }
 
   function formatAge(atMs) {
