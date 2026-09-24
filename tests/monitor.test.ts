@@ -637,6 +637,30 @@ describe("monitor", () => {
     expect(plain?.agent_state).toBe("working");
     expect(plain?.reason).toBeNull();
     expect(plain?.blockers).toEqual([]);
+    // A database whose stops predate waiting_on reports it as unsaid.
+    expect(stopped?.waiting_on).toBeNull();
+  });
+
+  test("reports who a stop waits on, and only for stops", async () => {
+    const dbPath = temporaryDatabasePath();
+    seedDatabase(dbPath, Date.now());
+    const database = new Database(dbPath, { strict: true });
+    database.exec("ALTER TABLE activity_events ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0");
+    database.exec("ALTER TABLE activity_events ADD COLUMN reason TEXT");
+    database.exec("ALTER TABLE activity_events ADD COLUMN waiting_on TEXT");
+    database.exec(
+      `UPDATE activity_events
+       SET agent_state = 'done', stopped = 1, reason = 'pick a design', waiting_on = 'user'
+       WHERE agent_id = 'charlie'`,
+    );
+    // A stray value on a non-stop row must never surface.
+    database.exec("UPDATE activity_events SET waiting_on = 'external' WHERE agent_id = 'alpha'");
+    database.close(false);
+    const monitor = startTestMonitor(dbPath);
+
+    const state = await fetchState(monitor);
+    expect(state.events.find((event) => event.agent_id === "charlie")?.waiting_on).toBe("user");
+    expect(state.events.find((event) => event.agent_id === "alpha")?.waiting_on).toBeNull();
   });
 
   test("bounds the activity payload and reports older retained events", async () => {
@@ -744,6 +768,9 @@ describe("monitor", () => {
     expect(html).toContain("function waitingText(blockers)");
     expect(html).toContain('el("div", "waiting-note")');
     expect(html).toContain('task.outcome === "stopped"');
+    // A stop names who it waits on, so a question for the user stands apart.
+    expect(html).toContain("function stopLabel(waitingOn)");
+    expect(html).toContain('if (waitingOn === "user") return "waiting on you"');
     // A testing or planning agent is live but holds nothing, so its card must
     // say so instead of reading like an ordinary set of claims.
     expect(html).toContain('var testing = lease.agent_state === "testing"');
@@ -1099,6 +1126,8 @@ describe("monitor", () => {
             status: "weird",
             event_type: "renewed",
             reason: "r".repeat(1_000),
+            agent_state: "stopped",
+            waiting_on: "everyone",
             blockers: [
               ...Array.from({ length: 20 }, (_, i) => ({
                 agent_id: "blocker-" + i,
@@ -1140,6 +1169,8 @@ describe("monitor", () => {
     // Blockers and the stop reason are peer-authored too: bounded, truncated,
     // and empty entries dropped.
     expect(snapshot?.events[0]?.reason?.length).toBe(200);
+    // An unknown waiting_on is dropped rather than rendered.
+    expect(snapshot?.events[0]?.waiting_on).toBeNull();
     expect(snapshot?.events[0]?.blockers.length).toBe(8);
     expect(snapshot?.events[0]?.blockers[0]?.path.length).toBe(512);
     expect(snapshot?.event_count).toBe(10_000);

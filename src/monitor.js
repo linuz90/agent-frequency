@@ -210,6 +210,15 @@
     return icon;
   }
 
+  // Names who a stop waits on, so a question for the user reads differently
+  // from a stop blocked elsewhere or simply parked. Older agents never say.
+  function stopLabel(waitingOn) {
+    if (waitingOn === "user") return "waiting on you";
+    if (waitingOn === "external") return "waiting elsewhere";
+    if (waitingOn === "none") return "parked";
+    return "stopped";
+  }
+
   // A deliberate stop without a finish: an octagon, between the completion
   // check and the quiet clock — the agent said it was ending, and said why.
   function stopIcon(className) {
@@ -575,6 +584,7 @@
           // the run unfinished and said why, "expired" when it went quiet.
           outcome: "expired",
           reason: null,
+          waiting_on: null,
           // Whether this session ever announced anything but planning here.
           edited: false,
         };
@@ -583,6 +593,7 @@
       if (event.agent_state === "done" || event.agent_state === "stopped") {
         task.outcome = event.agent_state === "stopped" ? "stopped" : "released";
         task.reason = event.reason || null;
+        task.waiting_on = event.agent_state === "stopped" ? event.waiting_on || null : null;
         tasks.push(task);
         open.delete(key);
       } else {
@@ -754,7 +765,7 @@
         if (task.outcome === "expired") meta.appendChild(el("span", null, "lease ran out"));
         if (task.outcome === "stopped") {
           meta.appendChild(
-            el("span", "task-reason", "stopped: " + (task.reason || "unfinished"))
+            el("span", "task-reason", stopLabel(task.waiting_on) + ": " + (task.reason || "unfinished"))
           );
         }
         if (sessions.size > 1) {
@@ -1627,7 +1638,9 @@
       if ((event.blockers || []).length > 0) status.title = waitingTitle(event.blockers);
       outcome.appendChild(status);
       if (event.agent_state === "stopped" && event.reason) {
-        outcome.appendChild(el("span", "activity-reason", "“" + event.reason + "”"));
+        outcome.appendChild(
+          el("span", "activity-reason", (event.waiting_on ? stopLabel(event.waiting_on) + ": " : "") + "“" + event.reason + "”")
+        );
       }
       var scopeText = activityScopes(event);
       if (scopeText) outcome.appendChild(el("span", null, scopeText));

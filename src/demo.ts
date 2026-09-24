@@ -4,11 +4,11 @@ import { homedir } from "node:os";
 import { Database } from "bun:sqlite";
 
 import type { ClientSurface } from "./client-surface";
-import { sanitizeReason, sanitizeSummary } from "./coordinate";
+import { sanitizeReason, sanitizeSummary, sanitizeWaitingOn } from "./coordinate";
 import { sanitizeEmoji } from "./emoji";
 import { AgentFrequencyStore, defaultDatabasePath } from "./store";
 import { DEFAULT_TIMEBOX } from "./types";
-import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox } from "./types";
+import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox, WaitingOn } from "./types";
 
 /**
  * Development-only traffic generator for the monitor UI.
@@ -80,6 +80,8 @@ interface DemoAnnouncement {
   state?: AgentState;
   /** Why a "stopped" entry ended unfinished; required with that state. */
   reason?: string;
+  /** Who a "stopped" entry waits on. */
+  waitingOn?: WaitingOn;
   /** Reuse this agent's previous lease so the feed shows a renewal. */
   renew?: boolean;
 }
@@ -322,7 +324,8 @@ const TIMELINE: DemoAnnouncement[] = [
     summary: "Note storage migration paused",
     emoji: "🗄️",
     state: "stopped",
-    reason: "waiting on user: keep dual-write or cut over to SQLite now",
+    reason: "keep dual-write or cut over to SQLite now?",
+    waitingOn: "user",
     renew: true,
   },
   {
@@ -382,6 +385,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
       // fixtures can never render something a real announcement could not.
       summary: sanitizeSummary(entry.summary),
       reason: sanitizeReason(entry.reason, entry.state ?? "working"),
+      waitingOn: sanitizeWaitingOn(entry.waitingOn, entry.state ?? "working"),
       emoji: sanitizeEmoji(entry.emoji),
       metadata: demoMetadata(worktree, home),
       scopes: entry.scopes ?? [],

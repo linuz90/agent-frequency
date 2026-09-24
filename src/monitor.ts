@@ -11,7 +11,9 @@ import {
   agentStateFromLease,
   agentStateFromRow,
   normalizeAgentState,
+  normalizeWaitingOn,
   type AgentState,
+  type WaitingOn,
 } from "./types";
 
 const DEFAULT_PORT = 7893;
@@ -105,6 +107,9 @@ export interface MonitorEvent {
   // The agent's own words on why it stopped without finishing; null unless
   // agent_state is "stopped".
   reason: string | null;
+  // Who a stop waits on: "user", "external", or "none"; null for every other
+  // state, and for stops from agents that did not say.
+  waiting_on: WaitingOn | null;
   emoji: string | null;
   repo_name: string;
   worktree_root: string;
@@ -575,6 +580,7 @@ function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): Monit
     agent_state: normalizeAgentState(row.agent_state),
     summary: boundedPeerText(row.summary, 200),
     reason: boundedPeerNullableText(row.reason, 200),
+    waiting_on: row.agent_state === "stopped" ? normalizeWaitingOn(row.waiting_on) : null,
     // Stricter than bounding: a peer's emoji is only rendered when it really is
     // a single emoji, so a remote monitor cannot inject a text banner here.
     emoji: sanitizeEmoji(row.emoji),
@@ -652,6 +658,9 @@ function readEvents(
     const reasonColumn = hasColumn(database, "activity_events", "reason")
       ? "reason"
       : "NULL AS reason";
+    const waitingOnColumn = hasColumn(database, "activity_events", "waiting_on")
+      ? "waiting_on"
+      : "NULL AS waiting_on";
     const blockersColumn = hasColumn(database, "activity_events", "blockers")
       ? "blockers"
       : "'[]' AS blockers";
@@ -660,7 +669,7 @@ function readEvents(
       : "NULL AS emoji";
     const rows = database
       .query(
-        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${planningColumn}, ${stoppedColumn}, ${reasonColumn}, summary, ${emojiColumn},
+        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${planningColumn}, ${stoppedColumn}, ${reasonColumn}, ${waitingOnColumn}, summary, ${emojiColumn},
                 repo_name, worktree_root, branch, requested_scope_count,
                 granted_scope_count, blocked_scope_count, ${blockersColumn}, peer_count, created_at_ms,
                 count(*) OVER () AS total_count
@@ -701,6 +710,7 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
     }),
     summary: toText(row.summary),
     reason: toNullableText(row.reason),
+    waiting_on: row.stopped ? normalizeWaitingOn(row.waiting_on) : null,
     emoji: sanitizeEmoji(row.emoji),
     repo_name: toText(row.repo_name),
     worktree_root: toText(row.worktree_root),

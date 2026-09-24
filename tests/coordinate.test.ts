@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { coordinateAnnouncement, sanitizeReason, sanitizeSummary } from "../src/coordinate";
+import { coordinateAnnouncement, sanitizeReason, sanitizeSummary, sanitizeWaitingOn } from "../src/coordinate";
 
 const temporaryDirectories: string[] = [];
 
@@ -21,6 +21,21 @@ describe("sanitizeSummary", () => {
   test("rejects empty and oversized summaries", () => {
     expect(() => sanitizeSummary("\n\t")).toThrow("visible text");
     expect(() => sanitizeSummary("x".repeat(161))).toThrow("at most 160");
+  });
+});
+
+describe("sanitizeWaitingOn", () => {
+  test("keeps a known value on a stop and drops it everywhere else", () => {
+    expect(sanitizeWaitingOn("user", "stopped")).toBe("user");
+    expect(sanitizeWaitingOn("external", "stopped")).toBe("external");
+    expect(sanitizeWaitingOn("none", "stopped")).toBe("none");
+    expect(sanitizeWaitingOn("user", "done")).toBeNull();
+    expect(sanitizeWaitingOn("user", "working")).toBeNull();
+  });
+
+  test("an unsaid or unknown value reads back as null, never a guess", () => {
+    expect(sanitizeWaitingOn(undefined, "stopped")).toBeNull();
+    expect(sanitizeWaitingOn("boss", "stopped")).toBeNull();
   });
 });
 
