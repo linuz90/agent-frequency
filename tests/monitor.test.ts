@@ -769,8 +769,13 @@ describe("monitor", () => {
     expect(html).toContain('el("div", "waiting-note")');
     expect(html).toContain('task.outcome === "stopped"');
     // A stop names who it waits on, so a question for the user stands apart.
-    expect(html).toContain("function stopLabel(waitingOn)");
+    expect(html).toContain("function stopLabel(waitingOn, resumed)");
     expect(html).toContain('if (waitingOn === "user") return "waiting on you"');
+    // Once the stopping session speaks again, in either view, the stop is over
+    // and must not keep reading as waiting on anyone.
+    expect(html).toContain('if (resumed) return "resumed"');
+    expect(html).toContain("task.resumed = live.has(session) || lastHeard.get(session) > task.ended_at_ms");
+    expect(html).toContain("var resumed = heardLater.has(session)");
     // A testing or planning agent is live but holds nothing, so its card must
     // say so instead of reading like an ordinary set of claims.
     expect(html).toContain('var testing = lease.agent_state === "testing"');

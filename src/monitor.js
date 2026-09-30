@@ -212,7 +212,10 @@
 
   // Names who a stop waits on, so a question for the user reads differently
   // from a stop blocked elsewhere or simply parked. Older agents never say.
-  function stopLabel(waitingOn) {
+  // A stop whose session spoke again is over whoever it named: the user
+  // answered or the wait ended, so "waiting on you" would be stale.
+  function stopLabel(waitingOn, resumed) {
+    if (resumed) return "resumed";
     if (waitingOn === "user") return "waiting on you";
     if (waitingOn === "external") return "waiting elsewhere";
     if (waitingOn === "none") return "parked";
@@ -544,12 +547,29 @@
     return (machine || "") + "\u0000" + agentId + "\u0000" + worktreeRoot;
   }
 
+  // Agent ids are per session, so a session heard from after its stop, in
+  // any worktree, picked it back up. Other sessions' later work proves
+  // nothing: one worktree routinely hosts unrelated tasks.
+  function sessionKey(machine, agentId) {
+    return (machine || "") + "\u0000" + agentId;
+  }
+
+  function liveSessions(state) {
+    var live = new Set();
+    leaseEntries(state).forEach(function (entry) {
+      live.add(sessionKey(entry.machine, entry.lease.agent_id));
+    });
+    return live;
+  }
+
   function recentTasks(state) {
     var entries = eventEntries(state);
     var active = new Set();
     leaseEntries(state).forEach(function (entry) {
       active.add(taskKey(entry.machine, entry.lease.agent_id, entry.lease.worktree_root));
     });
+    var live = liveSessions(state);
+    var lastHeard = new Map();
 
     var open = new Map();
     var tasks = [];
@@ -558,6 +578,7 @@
     for (var index = entries.length - 1; index >= 0; index -= 1) {
       var entry = entries[index];
       var event = entry.event;
+      lastHeard.set(sessionKey(entry.machine, event.agent_id), event.created_at_ms);
       var key = taskKey(entry.machine, event.agent_id, event.worktree_root);
       var task = open.get(key);
       if (task) {
@@ -585,6 +606,8 @@
           outcome: "expired",
           reason: null,
           waiting_on: null,
+          // Whether a stopped session was heard from again afterwards.
+          resumed: false,
           // Whether this session ever announced anything but planning here.
           edited: false,
         };
@@ -605,6 +628,11 @@
       // A session that never announced "done" is only past work once its
       // lease is gone; while it is live its own card already shows it.
       if (!active.has(key)) tasks.push(task);
+    });
+    tasks.forEach(function (task) {
+      if (task.outcome !== "stopped") return;
+      var session = sessionKey(task.machine, task.agent_id);
+      task.resumed = live.has(session) || lastHeard.get(session) > task.ended_at_ms;
     });
 
     tasks.sort(function (left, right) {
@@ -765,7 +793,11 @@
         if (task.outcome === "expired") meta.appendChild(el("span", null, "lease ran out"));
         if (task.outcome === "stopped") {
           meta.appendChild(
-            el("span", "task-reason", stopLabel(task.waiting_on) + ": " + (task.reason || "unfinished"))
+            el(
+              "span",
+              "task-reason",
+              stopLabel(task.waiting_on, task.resumed) + ": " + (task.reason || "unfinished")
+            )
           );
         }
         if (sessions.size > 1) {
@@ -1556,8 +1588,14 @@
     );
     section.appendChild(head);
 
+    // The feed runs newest first, so a session already passed here spoke
+    // after the call being rendered.
+    var heardLater = liveSessions(state);
     shown.forEach(function (entry) {
       var event = entry.event;
+      var session = sessionKey(entry.machine, event.agent_id);
+      var resumed = heardLater.has(session);
+      heardLater.add(session);
       var call = el("article", "activity-call");
       call.setAttribute(
         "data-state",
@@ -1639,7 +1677,14 @@
       outcome.appendChild(status);
       if (event.agent_state === "stopped" && event.reason) {
         outcome.appendChild(
-          el("span", "activity-reason", (event.waiting_on ? stopLabel(event.waiting_on) + ": " : "") + "“" + event.reason + "”")
+          el(
+            "span",
+            "activity-reason",
+            (resumed || event.waiting_on ? stopLabel(event.waiting_on, resumed) + ": " : "") +
+              "“" +
+              event.reason +
+              "”"
+          )
         );
       }
       var scopeText = activityScopes(event);

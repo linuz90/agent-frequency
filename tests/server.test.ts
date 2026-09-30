@@ -56,6 +56,11 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   // Agents otherwise narrate every peer they see back to the user, which turns
   // ambient presence into noise in reports.
   expect(instructions).toContain("not material for your reports");
+  // Both are how a stop goes stale on a "waiting on you" list: a finished task
+  // stopped only to offer shipping, and a resumed stop that never spoke again.
+  expect(instructions).toContain("offering a next step is not waiting");
+  expect(instructions).toContain("announce again before anything else");
+  expect(tools.tools[0]?.description).toContain("announce again before anything else");
 
   // Planning crosses the process boundary as pure advertisement: the same
   // exclusive request that blocks a peer below is downgraded, capped to the
