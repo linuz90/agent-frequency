@@ -10,11 +10,23 @@ export const TIMEBOX_SECONDS = {
 
 export const AGENT_STATES = ["planning", "working", "testing", "done", "stopped"] as const;
 export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
+// Who a stopped run is waiting on. A bare stop conflates three different
+// endings, and only one of them is a question for the user: "user" needs the
+// user's decision or action before the work can continue, "external" waits on
+// something outside the conversation (a release, CI, a service, another team),
+// and "none" parked or gave up with nobody expected to act. Null means the
+// stopping agent did not say, which is every stop from an older process.
+export const WAITING_ON = ["user", "external", "none"] as const;
 
 export type Timebox = keyof typeof TIMEBOX_SECONDS;
 export type Access = "shared" | "exclusive";
 export type AgentState = (typeof AGENT_STATES)[number];
 export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
+export type WaitingOn = (typeof WAITING_ON)[number];
+
+export function normalizeWaitingOn(value: unknown): WaitingOn | null {
+  return WAITING_ON.includes(value as WaitingOn) ? (value as WaitingOn) : null;
+}
 
 // A lease is crash protection, not a task estimate. Healthy agents renew as
 // they report progress, so the shortest bucket minimizes stale blockers.
@@ -101,6 +113,9 @@ export interface AnnounceInput {
   // Why a run is ending without finishing. Required with state "stopped",
   // ignored otherwise: "done" already means success and needs no explanation.
   reason?: string;
+  // Who the stopped run is waiting on. Optional and ignored unless state is
+  // "stopped", so callers that predate it keep working and record null.
+  waiting_on?: WaitingOn;
   traffic_scope?: TrafficScope;
 }
 
@@ -191,6 +206,9 @@ export interface RecentPeer {
   // The stopping agent's own words on why it did not finish; null unless the
   // outcome is "stopped".
   reason: string | null;
+  // Who the stop is waiting on; null unless the outcome is "stopped" and the
+  // stopping agent said.
+  waiting_on: WaitingOn | null;
   repo: string;
   branch: string | null;
   last_heard: string;
@@ -247,6 +265,7 @@ export interface StoreAnnounceRequest {
   trafficScope: TrafficScope;
   summary: string;
   reason?: string | null;
+  waitingOn?: WaitingOn | null;
   emoji?: string | null;
   metadata: GitMetadata;
   scopes: Scope[];

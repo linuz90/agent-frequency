@@ -56,6 +56,11 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   // Agents otherwise narrate every peer they see back to the user, which turns
   // ambient presence into noise in reports.
   expect(instructions).toContain("not material for your reports");
+  // Both are how a stop goes stale on a "waiting on you" list: a finished task
+  // stopped only to offer shipping, and a resumed stop that never spoke again.
+  expect(instructions).toContain("offering a next step is not waiting");
+  expect(instructions).toContain("announce again before anything else");
+  expect(tools.tools[0]?.description).toContain("announce again before anything else");
 
   // Planning crosses the process boundary as pure advertisement: the same
   // exclusive request that blocks a peer below is downgraded, capped to the
@@ -310,6 +315,20 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   });
   expect(reasonless.isError).toBeTrue();
 
+  // waiting_on is a closed set: a value outside it fails the schema.
+  const unknownWait = await claude.callTool({
+    name: "announce",
+    arguments: {
+      summary: "Flight plan review paused",
+      cwd: directory,
+      lease_id: secondLeaseId,
+      state: "stopped",
+      reason: "waiting on someone",
+      waiting_on: "boss",
+    },
+  });
+  expect(unknownWait.isError).toBeTrue();
+
   const stopped = await claude.callTool({
     name: "announce",
     arguments: {
@@ -318,6 +337,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       lease_id: secondLeaseId,
       state: "stopped",
       reason: "waiting on user: approve the new wording",
+      waiting_on: "user",
     },
   });
   const stoppedOutput = stopped.structuredContent as Record<string, unknown> | undefined;
@@ -343,6 +363,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     {
       outcome: "stopped",
       reason: "waiting on user: approve the new wording",
+      waiting_on: "user",
       summary: "Flight plan review paused",
     },
   ]);
@@ -350,7 +371,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const database = new Database(dbPath, { readonly: true });
   const events = database
     .query(
-      "SELECT status, client_surface, agent_state, testing, planning, stopped, reason FROM activity_events ORDER BY event_id ASC",
+      "SELECT status, client_surface, agent_state, testing, planning, stopped, reason, waiting_on FROM activity_events ORDER BY event_id ASC",
     )
     .all() as Array<{
       status: string;
@@ -360,13 +381,14 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       planning: number;
       stopped: number;
       reason: string | null;
+      waiting_on: string | null;
     }>;
   database.close(false);
   // The planning, testing, and stopped announcements store the v2 states plus
   // additive flags, so an older process reading these rows still parses them.
   // The reasonless stop above failed validation before reaching the store, so
   // it must not appear here at all.
-  const plain = { testing: 0, planning: 0, stopped: 0, reason: null };
+  const plain = { testing: 0, planning: 0, stopped: 0, reason: null, waiting_on: null };
   expect(events).toEqual([
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain, planning: 1 },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
@@ -388,6 +410,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       planning: 0,
       stopped: 1,
       reason: "waiting on user: approve the new wording",
+      waiting_on: "user",
     },
     { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
   ]);

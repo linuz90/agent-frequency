@@ -1,9 +1,9 @@
 import { sanitizeEmoji } from "./emoji";
 import { collectGitMetadata } from "./git";
 import { AgentFrequencyStore } from "./store";
-import { DEFAULT_TIMEBOX } from "./types";
+import { DEFAULT_TIMEBOX, normalizeWaitingOn } from "./types";
 import type { ClientSurface } from "./client-surface";
-import type { AnnounceInput, AnnounceOutput } from "./types";
+import type { AnnounceInput, AnnounceOutput, WaitingOn } from "./types";
 
 interface AgentIdentity {
   agentId: string;
@@ -47,6 +47,15 @@ export function sanitizeReason(value: string | undefined, state: string): string
   return reason;
 }
 
+/**
+ * Who a stop is waiting on travels only with "stopped", like its reason. It
+ * stays optional: requiring it would break every caller written before it
+ * existed, and an unset value honestly reads back as "did not say".
+ */
+export function sanitizeWaitingOn(value: unknown, state: string): WaitingOn | null {
+  return state === "stopped" ? normalizeWaitingOn(value) : null;
+}
+
 export async function coordinateAnnouncement(
   input: AnnounceInput,
   agent: AgentIdentity,
@@ -64,6 +73,7 @@ export async function coordinateAnnouncement(
       trafficScope: input.traffic_scope ?? "worktree",
       summary: sanitizeSummary(input.summary),
       reason: sanitizeReason(input.reason, input.state ?? "working"),
+      waitingOn: sanitizeWaitingOn(input.waiting_on, input.state ?? "working"),
       // An unusable emoji is decoration, not coordination data: drop it and let
       // the announcement through rather than failing a safety-relevant call.
       emoji: sanitizeEmoji(input.emoji),

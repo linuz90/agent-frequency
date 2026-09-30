@@ -1143,6 +1143,49 @@ describe("AgentFrequencyStore schema versioning", () => {
     expect(result.peers.map((peer) => [peer.agent_id, peer.emoji])).toEqual([["alpha", null]]);
   });
 
+  test("adds waiting_on to an existing v2 database without losing its stops", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-frequency-store-test-"));
+    temporaryDirectories.push(directory);
+    const dbPath = join(directory, "state.sqlite3");
+
+    const original = new AgentFrequencyStore({ dbPath });
+    const alpha = original.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    original.announce(
+      request("alpha", [], {
+        state: "stopped",
+        reason: "out of ideas",
+        leaseId: alpha.self.lease_id!,
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+    original.close();
+    const oldV2 = new Database(dbPath, { strict: true });
+    oldV2.exec("ALTER TABLE activity_events DROP COLUMN waiting_on");
+    oldV2.close(false);
+
+    const upgraded = new AgentFrequencyStore({ dbPath });
+    stores.push(upgraded);
+    const bravo = upgraded.announce(request("bravo", [], { nowMs: 1_800_000_002_000 }));
+    upgraded.announce(
+      request("bravo", [], {
+        state: "stopped",
+        reason: "approve the token change?",
+        waitingOn: "user",
+        leaseId: bravo.self.lease_id!,
+        nowMs: 1_800_000_003_000,
+      }),
+    );
+    const observer = upgraded.announce(request("charlie", [], { nowMs: 1_800_000_004_000 }));
+
+    // The stop written before the column existed reads back as unsaid.
+    expect(
+      observer.recent_peers.map((peer) => [peer.agent_id, peer.outcome, peer.waiting_on]),
+    ).toEqual([
+      ["bravo", "stopped", "user"],
+      ["alpha", "stopped", null],
+    ]);
+  });
+
   test("adds client surface and lifecycle metadata to an existing v2 database", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-frequency-store-test-"));
     temporaryDirectories.push(directory);
@@ -1215,6 +1258,7 @@ describe("stopped announcements", () => {
       request("alpha", [], {
         state: "stopped",
         reason: "waiting on user: keep or revert the token change",
+        waitingOn: "user",
         leaseId: alpha.self.lease_id!,
         summary: "Auth refactor paused",
         nowMs: 1_800_000_002_000,
@@ -1236,7 +1280,7 @@ describe("stopped announcements", () => {
     const database = new Database(dbPath, { readonly: true });
     const event = database
       .query(
-        `SELECT agent_state, stopped, reason FROM activity_events
+        `SELECT agent_state, stopped, reason, waiting_on FROM activity_events
          WHERE agent_id = 'alpha' ORDER BY event_id DESC LIMIT 1`,
       )
       .get() as Record<string, unknown>;
@@ -1245,7 +1289,43 @@ describe("stopped announcements", () => {
       agent_state: "done",
       stopped: 1,
       reason: "waiting on user: keep or revert the token change",
+      waiting_on: "user",
     });
+  });
+
+  test("waiting_on is recorded only on stops, and a stop may leave it unsaid", () => {
+    const { store, dbPath } = createStoreWithPath();
+    const alpha = store.announce(request("alpha", [], { waitingOn: "user" }));
+    store.announce(
+      request("alpha", [], {
+        state: "stopped",
+        reason: "waiting on the next stable release",
+        waitingOn: "external",
+        leaseId: alpha.self.lease_id!,
+        nowMs: 1_800_000_001_000,
+      }),
+    );
+    const bravo = store.announce(request("bravo", [], { nowMs: 1_800_000_002_000 }));
+    store.announce(
+      request("bravo", [], {
+        state: "stopped",
+        reason: "out of ideas",
+        leaseId: bravo.self.lease_id!,
+        nowMs: 1_800_000_003_000,
+      }),
+    );
+
+    const database = new Database(dbPath, { readonly: true });
+    const rows = database
+      .query("SELECT agent_id, stopped, waiting_on FROM activity_events ORDER BY event_id ASC")
+      .all();
+    database.close(false);
+    expect(rows).toEqual([
+      { agent_id: "alpha", stopped: 0, waiting_on: null },
+      { agent_id: "alpha", stopped: 1, waiting_on: "external" },
+      { agent_id: "bravo", stopped: 0, waiting_on: null },
+      { agent_id: "bravo", stopped: 1, waiting_on: null },
+    ]);
   });
 
   test("a blocked call records who was blocking, bounded and deduplicated", () => {
@@ -1332,6 +1412,7 @@ describe("recent peers", () => {
       request("alpha", [], {
         state: "stopped",
         reason: "typecheck fails in auth, out of ideas",
+        waitingOn: "none",
         leaseId: alpha.self.lease_id ?? undefined,
         summary: "alpha paused the auth work",
         nowMs: T + 5 * MINUTE,
@@ -1344,6 +1425,7 @@ describe("recent peers", () => {
       agent_id: "alpha",
       outcome: "stopped",
       reason: "typecheck fails in auth, out of ideas",
+      waiting_on: "none",
       summary: "alpha paused the auth work",
     });
   });
@@ -1360,7 +1442,11 @@ describe("recent peers", () => {
     );
 
     const observer = store.announce(request("beta", [], { nowMs: T + 2 * MINUTE }));
-    expect(observer.recent_peers[0]).toMatchObject({ outcome: "completed", reason: null });
+    expect(observer.recent_peers[0]).toMatchObject({
+      outcome: "completed",
+      reason: null,
+      waiting_on: null,
+    });
   });
 
   test("an agent whose lease lapsed without done is reported as expired", () => {

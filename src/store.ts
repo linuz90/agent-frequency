@@ -13,6 +13,7 @@ import {
   TIMEBOX_SECONDS,
   agentStateFromLease,
   isAdvisoryState,
+  normalizeWaitingOn,
   type AgentState,
   type AnnounceOutput,
   type BlockedScope,
@@ -476,6 +477,7 @@ export class AgentFrequencyStore {
         agent_state: string;
         stopped: number | null;
         reason: string | null;
+        waiting_on?: string | null;
         emoji: string | null;
         summary: string;
         repo_name: string;
@@ -493,6 +495,7 @@ export class AgentFrequencyStore {
       // has to be read first or every stop reads back as completed work.
       outcome: row.stopped ? "stopped" : row.agent_state === "done" ? "completed" : "expired",
       reason: row.stopped ? (row.reason ?? null) : null,
+      waiting_on: row.stopped ? normalizeWaitingOn(row.waiting_on) : null,
       repo: row.repo_name,
       branch: row.branch,
       last_heard: toIso(row.created_at_ms),
@@ -825,10 +828,10 @@ export class AgentFrequencyStore {
     this.database
       .query(
         `INSERT INTO activity_events (
-           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, planning, stopped, reason, summary, emoji, repo_name,
+           event_type, status, agent_id, agent_label, client_surface, agent_state, testing, planning, stopped, reason, waiting_on, summary, emoji, repo_name,
            worktree_root, branch, requested_scope_count, granted_scope_count,
            blocked_scope_count, blockers, peer_count, created_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         output.self.renewed ? "renewed" : "announced",
@@ -841,6 +844,7 @@ export class AgentFrequencyStore {
         request.state === "planning" ? 1 : 0,
         request.state === "stopped" ? 1 : 0,
         request.state === "stopped" ? (request.reason ?? null) : null,
+        request.state === "stopped" ? (request.waitingOn ?? null) : null,
         request.summary,
         request.emoji ?? null,
         request.metadata.repoName,
@@ -1209,6 +1213,17 @@ function initializeSchema(database: Database): void {
       "reason",
       "TEXT CHECK (reason IS NULL OR length(reason) <= 200)",
     );
+    // Who a stop waits on rides the same way: nullable, so a stop written by
+    // an older process reads back as "did not say" rather than a guess. The
+    // CHECK bounds length only, like reason's: an added column's CHECK can
+    // never be widened without rebuilding the table, and every reader already
+    // narrows the value through normalizeWaitingOn.
+    addColumnIfMissing(
+      database,
+      "activity_events",
+      "waiting_on",
+      "TEXT CHECK (waiting_on IS NULL OR length(waiting_on) <= 16)",
+    );
     addColumnIfMissing(
       database,
       "activity_events",
@@ -1314,6 +1329,7 @@ CREATE TABLE IF NOT EXISTS activity_events (
   planning INTEGER NOT NULL DEFAULT 0 CHECK (planning IN (0, 1)),
   stopped INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1)),
   reason TEXT CHECK (reason IS NULL OR length(reason) <= 200),
+  waiting_on TEXT CHECK (waiting_on IS NULL OR length(waiting_on) <= 16),
   summary TEXT NOT NULL,
   emoji TEXT CHECK (emoji IS NULL OR length(emoji) <= ${MAX_EMOJI_LENGTH}),
   repo_name TEXT NOT NULL,
