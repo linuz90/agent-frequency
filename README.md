@@ -4,11 +4,11 @@
 
 Coding agents can't see each other. Codex, Claude, and every other agent on your machine work as if they were alone: duplicating effort, editing the same files, racing toward the same branch. Every provider is its own silo, so even two agents in the same worktree can't coordinate.
 
-Agent Frequency gives them all one channel and **one lightweight operation**: `announce`. Before editing, an agent says **what it intends to do and where**, and the same atomic call returns **who else is working nearby**, with their active claims, overlapping scopes, and leftover changes. No agent can announce without hearing the traffic that should change its plan. And since it's plain MCP, **any client joins the same frequency**.
+Agent Frequency gives them all one channel and **one lightweight operation**: `announce`. Before editing, an agent says **what it is doing and which files it expects to touch**, and the same call returns **who else is working nearby**, what they are editing, and who recently left changes behind. No agent can announce without hearing the traffic that should change its plan. And since it's plain MCP, **any client joins the same frequency**.
 
-The metaphor is **aviation radio**: self-announce position and intent, listen for nearby traffic, no control tower in the middle. The product is **presence and collision awareness, not task management**.
+The metaphor is **aviation radio**: self-announce position and intent, listen for nearby traffic, no control tower in the middle. The product is **awareness, not locking or task management**: nothing is ever blocked, and each agent decides what to do with what it hears.
 
-The frequency is for the agents; the **[monitor](#monitor)** is for you. This optional read-only web UI shows live traffic at a glance, from any device you serve it to: who is working where, on what, and who is blocked.
+The frequency is for the agents; the **[monitor](#monitor)** is for you. This optional read-only web UI shows live traffic at a glance, from any device you serve it to: who is working where, on what, and who is waiting on you.
 
 ![The Agent Frequency monitor, showing eight agents working across four repositories](docs/monitor.png)
 
@@ -39,35 +39,34 @@ Agent Frequency is a local stdio MCP server exposing exactly one tool: `announce
   "summary": "Refactor token refresh handling",
   "emoji": "🔑",
   "cwd": "/Users/you/Code/app",
-  "scopes": [
-    { "path": "src/auth/token.ts", "access": "exclusive" },
-    { "path": "tests/auth", "access": "shared" }
-  ],
-  "timebox": "5m"
+  "paths": ["src/auth/token.ts", "tests/auth"]
 }
 ```
 
 ```jsonc
 // ← response
 {
-  "status": "granted",
-  "self": { "lease_id": "a1b2…", "branch": "main", "expires_at": "…" },
+  "status": "active",
+  "self": { "lease_id": "a1b2…", "branch": "main", "paths": ["src/auth/token.ts", "tests/auth"] },
   "peers": [
     {
       "label": "Codex",
       "surface": "cli",
       "summary": "Migrate the session store to Postgres",
       "relation": "same_worktree",
-      "scopes": [{ "path": "src/auth/session.ts", "access": "exclusive" }]
+      "paths": ["src/auth"]
     }
   ],
-  "warnings": [{ "code": "SAME_WORKTREE", "message": "Agents in this worktree: Codex …" }]
+  "warnings": [
+    { "code": "PATH_OVERLAP", "message": "Agents in this worktree are editing overlapping paths: src/auth/token.ts with Codex …:src/auth" },
+    { "code": "SAME_WORKTREE", "message": "Agents in this worktree: Codex …" }
+  ]
 }
 ```
 
-The agent now knows someone else is inside `src/auth/` before it starts editing.
+The agent now knows Codex is inside `src/auth/` before it starts editing, and can work around it, go after it, or edit alongside it.
 
-State lives in a local SQLite database. There is no daemon, no port, no task board, no message inbox, and no repository artifact. Separate MCP subprocesses share the database directly, using WAL and `BEGIN IMMEDIATE` so simultaneous exclusive claims serialize before conflict evaluation.
+State lives in a local SQLite database. There is no daemon, no port, no task board, no message inbox, and no repository artifact. Separate MCP subprocesses share the database directly, using WAL and `BEGIN IMMEDIATE`, so concurrent announcements each see a consistent snapshot.
 
 ## Install
 
@@ -99,46 +98,41 @@ Verify the registration anytime:
 
 | Field | Description |
 | --- | --- |
-| `summary` | Concise single-line description of the work. Required. |
+| `summary` | One line on what the agent is doing now. Required. |
 | `emoji` | One emoji for the task, shown beside it in the monitor. Display only. |
 | `cwd` | Absolute path inside a Git worktree. Everything else is derived from Git. Required. |
-| `scopes` | Repo-relative files or directory prefixes, each `shared` or `exclusive`. `.` means the whole repo. |
-| `state` | `planning`, `working` (default), `testing`, `done`, or `stopped`. |
+| `paths` | Repo-relative files or folders the agent expects to edit. `.` means the whole repo. Shown to peers; never locks anything. |
+| `state` | `working` (default), `done`, or `stopped`. |
 | `reason` | Why the run is ending unfinished. Required with `state: "stopped"`, ignored otherwise. |
 | `waiting_on` | Who must act before a stopped run continues: `user`, `external`, or `none`. Optional with `state: "stopped"`, ignored otherwise. |
-| `timebox` | `5m` (default), `15m`, `30m`, `1h`, or `2h`: how long the lease survives without a renewal, not a task budget. Choose aggressively and err short; use a longer bucket only when one uninterrupted operation will prevent renewal before `renew_after`. Forced to `5m` while planning. |
 | `traffic_scope` | Peer detail breadth: `worktree` (default), `project`, or `machine`. |
 | `lease_id` | Handle from the previous response. Renews and replaces that lease. |
 
-**Claims.** The physical worktree is the arbitration boundary. Inside it, `shared` scopes coexist with a warning and `exclusive` scopes block every overlapping incoming claim until they expire. A matching claim in another worktree remains useful integration context, but never blocks or raises a path-overlap warning. Claims are advisory: blocked means coordinate before editing the shared checkout; nothing stops an uncooperative process from writing.
+**Paths are awareness, not claims.** Nothing is ever blocked. When an agent announces paths that overlap a live peer's in the same physical worktree, both learn about it through a `PATH_OVERLAP` warning (the earlier agent on its next call), and each decides whether to work around the other, go after it, or edit alongside it. A matching path in another worktree is a different copy of the file: it stays visible as context and raises no warning.
 
-**Status** is `granted` (all scopes published), `partial` (compatible scopes published, conflicting ones withheld), `blocked` (nothing published), `completed`, or `stopped` (both terminal: the lease and its claims were released; they differ only in whether the work finished).
+**Status** is `active` while the agent is on the frequency, and `completed` or `stopped` once a terminal call released the lease; those two differ only in whether the work finished.
 
 **The emoji is decoration**, never coordination input. Anything that is not exactly one emoji is dropped while the announcement still lands, so a model that sends a sentence loses the glyph, not the lease.
 
-**Peers** are classified `same_worktree`, `same_clone`, `same_project`, or `other_project`. Physical worktree identity beats remote heuristics, so an origin hiccup can never hide an agent editing the same files. `traffic_scope` filters what you *see*, never what can block: arbitration always stays inside the physical worktree, while `hidden_peers` counts context filtered from the response.
+**Peers** are classified `same_worktree`, `same_clone`, `same_project`, or `other_project`. Physical worktree identity beats remote heuristics, so an origin hiccup can never hide an agent editing the same files. By default a response lists the same worktree, same-branch peers in other worktrees, and path overlaps anywhere in the project; `traffic_scope` widens that, and `hidden_peers` counts what was filtered out. Warnings are `PATH_OVERLAP`, `SAME_WORKTREE`, `SAME_BRANCH` (the same branch name in another worktree or clone), and `INCOMPLETE_GIT_METADATA`.
 
-Peers also expose their worktree's dirty paths, answering in one call a common reason agents stall: *"there are changes here I didn't make."* Ownership comes from each peer's `scopes` and `summary`; same-worktree peers all snapshot the same tree, so their `dirty_paths` are everyone's edits combined and serve only as corroboration.
+Peers also expose their worktree's dirty paths, answering in one call a common reason agents stall: *"there are changes here I didn't make."* Ownership comes from each peer's `paths` and `summary`; same-worktree peers all snapshot the same tree, so their `dirty_paths` are everyone's edits combined and serve only as corroboration.
 
-**Recently heard.** When no active peer explains those changes, the culprit usually just left. `recent_peers` lists agents whose leases recently ended here: `completed`, `stopped` (with their `reason` and `waiting_on`; the changes may be half-done), or `expired` (a crash or abandoned session). Agents that only ever planned are left out; they edited nothing. It is orientation, not arbitration: entries carry a summary and an outcome but no claims, and the defaults (a 24h window for a fresh lease, the delta since your own previous announcement for renewals, five entries at most) keep it usually empty.
+**Recently heard.** When no active peer explains those changes, the culprit usually just left. `recent_peers` lists agents whose leases recently ended here: `completed`, `stopped` (with their `reason` and `waiting_on`; the changes may be half-done), or `expired` (a crash or abandoned session). Entries carry a summary and an outcome, and the defaults (a 24h window for a fresh lease, the delta since your own previous announcement for renewals, five entries at most) keep the list usually empty.
 
-**Planning** is the phase before any edit: investigating, reading code, designing a change not yet started. Announcing it early is mostly self-interest: a plan built against a stale worktree is wasted work, and `working` arrives too late to prevent that. Planned paths are advertisements, not claims, and sit outside arbitration in both directions. A planner blocks nobody, is blocked by nobody, and raises no warnings, yet still *receives* every warning and the full peer list, the traffic that can still change a plan. The timebox is forced to `5m`, because a stale card is the only thing a planner can cost; a longer phase renews. Re-announce as `working` before the first edit.
-
-**Testing** is the phase after the last edit: only tests, builds, or other verification are running. `state: "testing"` keeps the lease live and the scopes visible but stops them blocking, so a waiting peer in the same worktree is unblocked at verification rather than at `done`. Same-worktree overlapping callers get a `TESTING_SCOPE_OVERLAP` warning, since edits underneath a running verification can invalidate it, and the tester returns to `working` before touching files again.
-
-**Stopping** is the honest ending for a run that did not finish: pausing to ask the user something, giving up, or parking the work. `state: "stopped"` requires a `reason` and releases the lease and claims exactly like `done` (blocking peers helps nobody once the run is over), but the record it leaves says the work is unfinished, so the next agent reads the leftover changes as half-done rather than completed. A stop can also say who it is waiting on: `waiting_on: "user"` only when the user must decide or act before the work continues, `"external"` when it waits on something outside the conversation (a release, CI, a service), and `"none"` when the work is simply parked or abandoned. It stays optional so older callers keep working, and an unsaid value is recorded as `null` rather than guessed. Only `user` stops are questions for the user, which is what lets a dashboard show a "waiting on you" list that does not fill up with blocked or parked work. Two habits keep that list honest. Finished work whose only open step is a commit, push, or deploy the user has not asked for is `done`, not a stop: offering a next step is not waiting. And since agent IDs are per session, a stop is only over once its session speaks again, so an agent that carries on after the user answers announces before anything else, even a one-line commit.
+**Stopping** is the honest ending for a run that did not finish: pausing to ask the user something, giving up, or parking the work. `state: "stopped"` requires a `reason` and releases the lease exactly like `done`, but the record it leaves says the work is unfinished, so the next agent reads the leftover changes as half-done rather than completed. A stop can also say who it is waiting on: `waiting_on: "user"` only when the user must decide or act before the work continues, `"external"` when it waits on something outside the conversation (a release, CI, a service), and `"none"` when the work is simply parked or abandoned. It stays optional so older callers keep working, and an unsaid value is recorded as `null` rather than guessed. Only `user` stops are questions for the user, which is what lets a dashboard show a "waiting on you" list that does not fill up with parked work. Two habits keep that list honest. Finished work whose only open step is a commit, push, or deploy the user has not asked for is `done`, not a stop: offering a next step is not waiting. And since agent IDs are per session, a stop is only over once its session speaks again, so an agent that carries on after the user answers announces before anything else, even a one-line commit.
 
 ### Leases
 
-Leases expire exactly at their timebox and are cleaned up lazily by later announcements. The default is `5m`: an active agent renews with its `lease_id` before `renew_after`, while a crashed agent stops blocking quickly. Timebox selection estimates the next check-in, not total task duration, and should be deliberately aggressive rather than conservative. Longer buckets remain available for uninterrupted operations that prevent a timely renewal. A `done` or `stopped` announcement deletes the lease and its claims atomically instead of waiting.
+A lease is presence, not a lock: it keeps an agent on the frequency for 30 minutes after its last announcement, and lapses on its own if the session crashes. Agents re-announce as their files or summary change, before committing, and roughly every 20 minutes otherwise (`renew_after`). Expired leases are cleaned up lazily by later announcements, and a `done` or `stopped` announcement deletes the lease immediately.
 
-One timing limitation is fundamental: of two simultaneous callers, the later sees the earlier, but the earlier learns nothing new until it announces again. The pre-commit and pre-push refresh covers that gap without a second tool.
+One timing limitation is fundamental: of two simultaneous callers, the later sees the earlier, but the earlier learns nothing new until it announces again. The pre-commit refresh covers that gap without a second tool.
 
 ## Monitor
 
 `./bin/agent-frequency-monitor` serves a live view of the frequency at `http://127.0.0.1:7893`, the page [shown above](#agent-frequency). Pass `--port` to move it.
 
-The **Agents** view groups everything by repository: active leases with summaries, branches, claims, dirty paths, and lease countdowns (a card whose last call came back blocked names who it is waiting on), followed by that project's **recent work**, the past day's finished tasks: a green check for done, an amber octagon and the agent's reason for stopped unfinished (labelled waiting on you, waiting elsewhere, or parked when the agent said who it waits on, and resumed once that session is heard from again), a quiet clock for a lapsed lease. Sessions from the same agent, app, machine, and worktree share one compact identity line while keeping separate cards. The **Activity** view lists recent announcements, check-ins, completions, and stops, naming the blocking agent on blocked calls. Both refresh every few seconds and filter down to a single project or machine.
+The **Agents** view groups everything by repository: active leases with summaries, branches, the paths each agent is editing, dirty paths, and lease countdowns (a card whose paths overlap another agent's in the same checkout names that agent), followed by that project's **recent work**, the past day's finished tasks: a green check for done, an amber octagon and the agent's reason for stopped unfinished (labelled waiting on you, waiting elsewhere, or parked when the agent said who it waits on, and resumed once that session is heard from again), a quiet clock for a lapsed lease. Sessions from the same agent, app, machine, and worktree share one compact identity line while keeping separate cards. The **Activity** view lists recent announcements, check-ins, completions, and stops. Both refresh every few seconds and filter down to a single project or machine.
 
 Inside a project, cards cluster by worktree whenever that says something: the project spans several checkouts, or one checkout holds several agents. Each cluster leads with a quiet head naming the branch, the path, and the case this product exists for: how many agents are inside that one worktree at once. A single agent in a single checkout gets no such head.
 
@@ -146,7 +140,7 @@ Inside a project, cards cluster by worktree whenever that says something: the pr
 
 <p align="center"><em>One project in view: three independent Claude sessions share one compact identity line on <code>main</code>, beside another agent, while a fifth works in the <code>feat/billing</code> worktree.</em></p>
 
-A card leads with the agent and its task emoji, then chips the host app, the machine, the session, and the lease it has left. A check-in gap past half the declared timebox turns the timestamp amber: a crashed session keeps claiming files until its lease expires, and silence is the first cheap sign of one. Red is kept for scopes an agent is actually blocked on.
+A card leads with the agent and its task emoji, then chips the host app, the machine, the session, and the lease it has left. A check-in gap past half the lease window turns the timestamp amber: a crashed session stays on the board until its lease expires, and silence is the first cheap sign of one.
 
 The monitor is strictly read-only: it opens SQLite in read-only mode, never mutates a lease, and binds to loopback only. Everything it renders is peer-authored text assigned through `textContent`. To reach it from another device, put it behind something like a Tailscale Serve proxy, and read the privacy section first, since the page exposes dirty filenames.
 
@@ -177,7 +171,7 @@ Cards then name their machine, local rows included, and the filter gains a **Mac
 
 What crosses the wire, and what does not:
 
-- **Announcements never leave a machine.** Arbitration, blocking, and warnings stay local, because the risks `announce` guards against are local by nature; cross-machine traffic is context for you, never input to another machine's decisions.
+- **Announcements never leave a machine.** Peers and warnings in an `announce` response come from local state only, because the overlaps they describe are local by nature; cross-machine traffic is context for you, never input to another machine's agents.
 - **A bad peer cannot break the local view.** Slow, down, or nonsense responses degrade to an unreachable row; payloads are bounded, re-sanitized, and clamped to a live-lease window before rendering.
 - **Aggregating pulls summaries, absolute worktree paths, and dirty filenames onto the reading machine.** Peer only with machines you trust, and read the privacy section first.
 
@@ -226,7 +220,7 @@ On Linux, the equivalent is a user systemd unit with `Restart=always` and `Wante
 
 ### Demo traffic
 
-Designing against real traffic means waiting for other agents to happen to announce. `./bin/agent-frequency-demo` fills the gap with a fixed timeline: ten sessions across four fake projects, exercising every client surface, compact same-agent grouping, and every announcement outcome from granted to blocked to listening-only.
+Designing against real traffic means waiting for other agents to happen to announce. `./bin/agent-frequency-demo` fills the gap with a fixed timeline: ten sessions across four fake projects, exercising every client surface, compact same-agent grouping, a same-worktree path overlap, and every ending from done to stopped to a quiet lapse.
 
 ```bash
 ./bin/agent-frequency-demo seed     # replace any existing demo traffic
@@ -234,7 +228,7 @@ Designing against real traffic means waiting for other agents to happen to annou
 ./bin/agent-frequency-demo clear    # remove every demo row
 ```
 
-Demo traffic is safe to seed into the live database: fixtures replay through the normal store API, so rows look real, but their synthetic worktree identities read as an unrelated project to every real agent, so a demo claim can never block or warn real work. Pass `--db <path>` to use a scratch database instead.
+Demo traffic is safe to seed into the live database: fixtures replay through the normal store API, so rows look real, but their synthetic worktree identities read as an unrelated project to every real agent, so demo paths can never warn about real work. Pass `--db <path>` to use a scratch database instead.
 
 ## Configuration
 
@@ -262,14 +256,14 @@ A monitor you start from somewhere else does not see that file, so pass its sett
 
 State lives at `~/.local/state/agent-frequency/state.sqlite3`, with the directory mode `0700` and the database mode `0600`. Set `AGENT_FREQUENCY_DB_PATH` to isolate tests or experiments. The schema version is explicit: an older database is dropped and recreated on open (leases are ephemeral), while a newer one fails loudly.
 
-Agent Frequency stores agent labels and summaries, client surfaces, lifecycle states, absolute worktree paths, branches, HEAD identifiers, dirty counts, normalized origin identities, scopes, and expiry timestamps. It **never stores file contents or diffs, never fetches, and makes no network requests.** Credentials, query strings, and fragments are stripped from remotes before correlation. Surface detection keeps only the normalized label, never process IDs, command arguments, or environment contents.
+Agent Frequency stores agent labels and summaries, client surfaces, lifecycle states, absolute worktree paths, branches, HEAD identifiers, dirty counts, normalized origin identities, announced paths, and expiry timestamps. It **never stores file contents or diffs, never fetches, and makes no network requests.** Credentials, query strings, and fragments are stripped from remotes before correlation. Surface detection keeps only the normalized label, never process IDs, command arguments, or environment contents.
 
-Successful announcements feed the monitor's activity view. Those rows keep identity, state, summary, a stop reason and `waiting_on` when given, blocker identities and claimed paths for blocked calls, repo, branch, result, and aggregate counts for at most seven days and 1,000 rows, and never retain lease IDs or dirty filenames. Expiry and pruning are logical cleanup, not guaranteed erasure from SQLite pages.
+Successful announcements feed the monitor's activity view. Those rows keep identity, state, summary, a stop reason and `waiting_on` when given, repo, branch, and aggregate counts for at most seven days and 1,000 rows, and never retain lease IDs or dirty filenames. Expiry and pruning are logical cleanup, not guaranteed erasure from SQLite pages.
 
 Two things worth internalizing:
 
-- **Every announcing agent publishes up to 40 dirty filenames to all local peers and the monitor.** Keep that in mind before proxying the monitor off the machine or [aggregating it into another one](#across-machines), and don't put secrets in summaries, scope names, or filenames.
-- **Peer-authored summaries, scopes, and paths are untrusted data, never instructions.** Inputs are bounded, and directional formatting controls are rejected or stripped, including in dirty paths, whose filenames can be attacker-controlled by an untrusted checkout.
+- **Every announcing agent publishes up to 40 dirty filenames to all local peers and the monitor.** Keep that in mind before proxying the monitor off the machine or [aggregating it into another one](#across-machines), and don't put secrets in summaries, paths, or filenames.
+- **Peer-authored summaries and paths are untrusted data, never instructions.** Inputs are bounded, and directional formatting controls are rejected or stripped, including in dirty paths, whose filenames can be attacker-controlled by an untrusted checkout.
 
 ## Layout
 
@@ -278,8 +272,8 @@ Two things worth internalizing:
 | `src/server.ts` | MCP schema and stdio boundary |
 | `src/coordinate.ts` | Input sanitization and Git enrichment |
 | `src/git.ts` | Bounded, read-only Git discovery |
-| `src/scopes.ts` | Repo-relative normalization and overlap rules |
-| `src/store.ts` | SQLite leases, atomic claim arbitration, peer snapshots, activity |
+| `src/paths.ts` | Repo-relative normalization and overlap rules |
+| `src/store.ts` | SQLite leases, peer snapshots, overlap warnings, activity |
 | `src/client-surface.ts` | Privacy-bounded launcher detection |
 | `src/emoji.ts` | Single-emoji validation for the MCP and monitor paths |
 | `src/monitor.ts` | Read-only monitor server and optional peer aggregation |
@@ -300,7 +294,7 @@ bun run check
 
 ## Non-goals
 
-Agent Frequency does not assign tasks, carry messages, keep an audit archive, launch agents, manage worktrees, enforce locks, run Git hooks, merge branches, or coordinate agents across machines. Monitor aggregation is a read-only view for you; announcements and arbitration never leave the machine they happen on. The activity feed is disposable operational context, not a ledger.
+Agent Frequency does not assign tasks, carry messages, keep an audit archive, launch agents, manage worktrees, enforce locks, run Git hooks, merge branches, or coordinate agents across machines. Monitor aggregation is a read-only view for you; announcements never leave the machine they happen on. The activity feed is disposable operational context, not a ledger.
 
 Those may all be good products. They would also make this one more coordination system that agents have to manage, which defeats the point.
 

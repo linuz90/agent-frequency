@@ -1,14 +1,13 @@
 import type { ClientSurface } from "./client-surface";
 
-export const TIMEBOX_SECONDS = {
-  "5m": 5 * 60,
-  "15m": 15 * 60,
-  "30m": 30 * 60,
-  "1h": 60 * 60,
-  "2h": 2 * 60 * 60,
-} as const;
+// How long an announcement keeps an agent on the frequency without another
+// word. Presence, not a lock: nothing waits on a lease, so the window only
+// trades how long a crashed session lingers against how often a live one has
+// to check in. Agents re-announce as their work changes anyway, so the window
+// is a backstop sized well past one ordinary chunk of work.
+export const LEASE_SECONDS = 30 * 60;
 
-export const AGENT_STATES = ["planning", "working", "testing", "done", "stopped"] as const;
+export const AGENT_STATES = ["working", "done", "stopped"] as const;
 export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
 // Who a stopped run is waiting on. A bare stop conflates three different
 // endings, and only one of them is a question for the user: "user" needs the
@@ -18,8 +17,6 @@ export const TRAFFIC_SCOPES = ["worktree", "project", "machine"] as const;
 // stopping agent did not say, which is every stop from an older process.
 export const WAITING_ON = ["user", "external", "none"] as const;
 
-export type Timebox = keyof typeof TIMEBOX_SECONDS;
-export type Access = "shared" | "exclusive";
 export type AgentState = (typeof AGENT_STATES)[number];
 export type TrafficScope = (typeof TRAFFIC_SCOPES)[number];
 export type WaitingOn = (typeof WAITING_ON)[number];
@@ -28,86 +25,22 @@ export function normalizeWaitingOn(value: unknown): WaitingOn | null {
   return WAITING_ON.includes(value as WaitingOn) ? (value as WaitingOn) : null;
 }
 
-// A lease is crash protection, not a task estimate. Healthy agents renew as
-// they report progress, so the shortest bucket minimizes stale blockers.
-export const DEFAULT_TIMEBOX: Timebox = "5m";
-
-// Planning is bounded to the shortest bucket no matter what the caller asks
-// for. A planner holds no claims, so a lease outliving its session costs
-// nothing but a stale card — and the board is the reason the state exists.
-// Renewing is the honest "still planning" signal.
-export const PLANNING_TIMEBOX: Timebox = "5m";
-
-/** The states whose paths are advertisement rather than a claim to respect. */
-export function isAdvisoryState(state: AgentState): boolean {
-  return state === "planning" || state === "testing";
-}
-
-export function normalizeAgentState(value: unknown): AgentState {
-  if (value === "done") return "done";
-  if (value === "stopped") return "stopped";
-  if (value === "planning") return "planning";
-  return value === "testing" ? "testing" : "working";
-}
-
 /**
- * The additive flag columns that ride beside `agent_state`. Named rather than
- * positional because they keep accruing: a fourth boolean in a row of `unknown`
- * arguments is a silent-misordering bug waiting to happen.
+ * Storage keeps the two v2 `agent_state` values and carries "stopped" in an
+ * additive flag column, so every read combines them. Rows from processes that
+ * predate this version may also carry the retired `planning` and `testing`
+ * flags; both described a live agent, so they read back as working.
  */
-export interface AgentStateFlags {
-  testing?: unknown;
-  stopped?: unknown;
-  planning?: unknown;
-}
-
-/**
- * Storage keeps the two v2 `agent_state` values and carries "testing",
- * "stopped", and "planning" in additive flag columns, so every read has to
- * combine them. See the schema comment in store.ts for why none became a new
- * enum value. Precedence runs terminal, then the most active live phase: no
- * honest row sets two flags, and preferring activity keeps a confused row from
- * understating what an agent is doing.
- */
-export function agentStateFromRow(state: unknown, flags: AgentStateFlags): AgentState {
-  if (flags.stopped) return "stopped";
-  if (flags.testing) return "testing";
-  if (flags.planning) return "planning";
-  return normalizeAgentState(state);
-}
-
-/**
- * A lease's state, cross-checked against the claims it holds. Neither testing
- * nor planning keeps an exclusive claim, so a lease still holding one is being
- * edited: an older process renewing that lease writes real claims without
- * knowing the flag column exists, which would otherwise leave a stale advisory
- * state behind and quietly turn a genuine exclusive claim into an advisory one.
- * Shared claims cannot be cross-checked this way — an advisory lease holds
- * those legitimately — so that narrow rollout window is accepted.
- */
-export function agentStateFromLease(
-  state: unknown,
-  flags: AgentStateFlags,
-  claims: ReadonlyArray<{ access: Access }>,
-): AgentState {
-  const resolved = agentStateFromRow(state, { testing: flags.testing, planning: flags.planning });
-  if (isAdvisoryState(resolved) && claims.some((claim) => claim.access === "exclusive")) {
-    return "working";
-  }
-  return resolved;
-}
-
-export interface Scope {
-  path: string;
-  access: Access;
+export function agentStateFromRow(state: unknown, stopped: unknown): AgentState {
+  if (stopped) return "stopped";
+  return state === "done" ? "done" : "working";
 }
 
 export interface AnnounceInput {
   summary: string;
   emoji?: string;
   cwd: string;
-  scopes?: Scope[];
-  timebox?: Timebox;
+  paths?: string[];
   lease_id?: string;
   state?: AgentState;
   // Why a run is ending without finishing. Required with state "stopped",
@@ -141,24 +74,10 @@ export type PeerRelation = "same_worktree" | "same_clone" | "same_project" | "ot
 
 export type HiddenPeerCounts = Record<PeerRelation, number>;
 
-export interface Blocker {
-  agent_id: string;
-  relation: "same_worktree";
-  path: string;
-  access: Access;
-  expires_at: string;
-  updated_at: string;
-}
-
-export interface BlockedScope extends Scope {
-  blockers: Blocker[];
-}
-
 export interface Peer {
   agent_id: string;
   label: string;
   surface: ClientSurface;
-  state: AgentState;
   summary: string;
   // Null when the peer announced no emoji, or one that failed validation.
   emoji: string | null;
@@ -168,18 +87,16 @@ export interface Peer {
   branch: string | null;
   dirty: boolean | null;
   dirty_paths: string[];
-  expires_at: string;
   updated_at: string;
-  scopes: Scope[];
+  // What the peer said it is editing. Awareness only: nothing here is a lock.
+  paths: string[];
 }
 
 export type WarningCode =
-  | "SHARED_SCOPE_OVERLAP"
-  | "TESTING_SCOPE_OVERLAP"
+  | "PATH_OVERLAP"
   | "SAME_WORKTREE"
   | "SAME_BRANCH"
-  | "INCOMPLETE_GIT_METADATA"
-  | "BROAD_EXCLUSIVE_SCOPE";
+  | "INCOMPLETE_GIT_METADATA";
 
 export interface CoordinationWarning {
   code: WarningCode;
@@ -187,10 +104,7 @@ export interface CoordinationWarning {
 }
 
 // A recently departed agent, reconstructed from the bounded activity feed.
-// Display-only context: arbitration never reads these, and unlike Peer there
-// are no claims to respect — the lease behind this entry is already gone.
-// Agents that only ever planned in a worktree are left out: they edited
-// nothing, so they answer neither question this list is for.
+// Display-only context: the lease behind this entry is already gone.
 export interface RecentPeer {
   agent_id: string;
   label: string;
@@ -215,16 +129,15 @@ export interface RecentPeer {
 }
 
 export interface AnnounceOutput {
-  // "completed" and "stopped" are the two terminal statuses: both mean the
-  // lease and claims were released, and they differ only in whether the work
+  // "active" while the agent is on the frequency. "completed" and "stopped"
+  // both mean the lease was released, and differ only in whether the work
   // actually finished.
-  status: "granted" | "partial" | "blocked" | "completed" | "stopped";
+  status: "active" | "completed" | "stopped";
   snapshot_at: string;
   traffic_scope: TrafficScope;
   self: {
     lease_id: string | null;
     renewed: boolean;
-    active: boolean;
     state: AgentState;
     agent_id: string;
     surface: ClientSurface;
@@ -232,14 +145,12 @@ export interface AnnounceOutput {
     emoji: string | null;
     expires_at: string | null;
     renew_after: string | null;
-    timebox: Timebox | null;
     repo: string;
     worktree: string;
     branch: string | null;
     dirty: boolean | null;
     metadata_complete: boolean;
-    granted_scopes: Scope[];
-    blocked_scopes: BlockedScope[];
+    paths: string[];
   };
   peers: Peer[];
   // Agents recently heard on this frequency whose leases have since ended.
@@ -250,10 +161,6 @@ export interface AnnounceOutput {
   hidden_peers: HiddenPeerCounts;
   peers_truncated: number;
   warnings: CoordinationWarning[];
-  // Latest blocker lease expiry when any scope is blocked, else null. The
-  // worst-case wait: every current blocker has expired by this time, and
-  // blockers may release sooner by announcing done.
-  retry_at: string | null;
   message: string;
 }
 
@@ -268,8 +175,7 @@ export interface StoreAnnounceRequest {
   waitingOn?: WaitingOn | null;
   emoji?: string | null;
   metadata: GitMetadata;
-  scopes: Scope[];
-  timebox: Timebox;
+  paths: string[];
   leaseId?: string;
   nowMs?: number;
 }

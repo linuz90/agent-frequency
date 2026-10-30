@@ -1,7 +1,7 @@
 // Client script for the monitor page, spliced inline into monitor.html by
 // pageAsset() in monitor.ts so the page ships as one self-contained response.
 //
-// Every value below (summaries, labels, branches, paths, claim paths) is
+// Every value below (summaries, labels, branches, announced and dirty paths) is
 // peer-authored and untrusted. The page therefore builds DOM nodes and
 // assigns textContent only; nothing here ever assembles markup from data.
 (function () {
@@ -211,7 +211,7 @@
   }
 
   // Names who a stop waits on, so a question for the user reads differently
-  // from a stop blocked elsewhere or simply parked. Older agents never say.
+  // from a stop waiting elsewhere or simply parked. Older agents never say.
   // A stop whose session spoke again is over whoever it named: the user
   // answered or the wait ended, so "waiting on you" would be stale.
   function stopLabel(waitingOn, resumed) {
@@ -259,22 +259,22 @@
 
   /**
    * The countdown chip stays short; the title says when the lease actually
-   * ends and how long a window the agent asked for.
+   * ends and how long its window is.
    */
   function expiryTitle(lease) {
     var when = new Date(lease.expires_at_ms).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });
-    var timebox = lease.timebox_seconds
-      ? " · " + formatDuration(lease.timebox_seconds * 1000) + " timebox"
+    var window = lease.timebox_seconds
+      ? " · " + formatDuration(lease.timebox_seconds * 1000) + " lease"
       : "";
-    return "Lease expires at " + when + timebox;
+    return "Lease expires at " + when + window;
   }
 
   // A lease keeps ticking after the process holding it dies, so silence is
-  // the first sign of a crashed agent. Half the declared timebox is the
-  // threshold. Only legacy or remote rows missing a timebox use a fallback.
+  // the first sign of a crashed agent. Half the lease window is the
+  // threshold. Only legacy or remote rows missing a window use a fallback.
   var UNKNOWN_TIMEBOX_STALE_MS = 15 * 60 * 1000;
 
   function staleAfterMs(lease) {
@@ -314,7 +314,7 @@
       var stale = now() - entry.atMs > entry.staleAfter;
       entry.node.classList.toggle("stale", stale);
       entry.node.title = stale
-        ? "No check-in for over half this lease's timebox; the agent may have stopped."
+        ? "No check-in for over half this lease's window; the agent may have stopped."
         : "";
     }
   }
@@ -446,6 +446,35 @@
   // traffic. Each entry carries its machine label and that machine's home
   // directory so absolute worktree paths abbreviate against the right
   // home.
+  // A monitor process started before awareness-only leases keeps serving
+  // this script from disk once its checkout updates, while its API still
+  // returns the claim-era shape. Read either shape until it restarts.
+  function normalizeState(state) {
+    var snapshots = [state];
+    (state.peers || []).forEach(function (peer) {
+      if (peer.snapshot) snapshots.push(peer.snapshot);
+    });
+    snapshots.forEach(function (snapshot) {
+      (snapshot.leases || []).forEach(function (lease) {
+        if (!Array.isArray(lease.paths)) {
+          lease.paths = (lease.claims || []).map(function (claim) {
+            return claim.path;
+          });
+        }
+        lease.agent_state = "working";
+      });
+      (snapshot.events || []).forEach(function (event) {
+        if (typeof event.path_count !== "number") {
+          event.path_count = event.requested_scope_count || 0;
+        }
+        if (event.agent_state !== "done" && event.agent_state !== "stopped") {
+          event.agent_state = "working";
+        }
+      });
+    });
+    return state;
+  }
+
   function leaseEntries(state) {
     var entries = [];
     var local = localMachineName(state);
@@ -490,11 +519,11 @@
     return total;
   }
 
-  // === Blockers ===
+  // === Path overlaps ===
 
   // Agent ids are "<label> <hex suffix>"; the last four suffix characters
   // are enough to tell two same-label sessions apart in a short mention.
-  function blockerName(agentId) {
+  function shortAgentName(agentId) {
     var id = agentId || "agent";
     var space = id.lastIndexOf(" ");
     if (space <= 0) return id.length > 12 ? id.slice(0, 12) + "…" : id;
@@ -502,39 +531,65 @@
     return id.slice(0, space) + " " + (suffix.length > 4 ? suffix.slice(suffix.length - 4) : suffix);
   }
 
-  // "waiting on Claude 8754" (+ optionally "and N more"), with the full
-  // blocker ids and claimed paths in the title. Blocker identity is recorded
-  // with the event by the announce call itself, so this is server-observed
-  // rather than self-reported.
-  function waitingText(blockers) {
+  // Same segment-wise rule as pathsOverlap in paths.ts, always ignoring
+  // case: most checkouts on macOS ignore it and the payload does not say
+  // which, and a false overlap between two paths differing only in case is
+  // the cheaper mistake.
+  function pathsOverlap(left, right) {
+    left = left.toLowerCase();
+    right = right.toLowerCase();
+    return (
+      left === "." ||
+      right === "." ||
+      left === right ||
+      left.indexOf(right + "/") === 0 ||
+      right.indexOf(left + "/") === 0
+    );
+  }
+
+  // Live agents in the same checkout whose announced paths overlap this
+  // one's: the PATH_OVERLAP warning both agents already received, made
+  // visible on the board.
+  function overlapsFor(entry, entries) {
+    var overlaps = [];
+    var seen = new Set();
+    entries.forEach(function (other) {
+      if ((other.machine || "") !== (entry.machine || "")) return;
+      if (other.lease.worktree_root !== entry.lease.worktree_root) return;
+      // Entry objects are rebuilt per call, so a lease is recognised by its
+      // agent: one session holds at most one lease per worktree.
+      if (other.lease.agent_id === entry.lease.agent_id) return;
+      entry.lease.paths.forEach(function (mine) {
+        other.lease.paths.forEach(function (theirs) {
+          var key = other.lease.agent_id + "\u0000" + theirs;
+          if (seen.has(key) || !pathsOverlap(mine, theirs)) return;
+          seen.add(key);
+          overlaps.push({ agent_id: other.lease.agent_id, path: theirs });
+        });
+      });
+    });
+    return overlaps;
+  }
+
+  // "overlaps with Claude 8754" (+ optionally "and N more"), with every
+  // agent and path in the title.
+  function overlapText(overlaps) {
     var names = [];
-    blockers.forEach(function (blocker) {
-      var name = blockerName(blocker.agent_id);
+    overlaps.forEach(function (overlap) {
+      var name = shortAgentName(overlap.agent_id);
       if (names.indexOf(name) === -1) names.push(name);
     });
-    var text = "waiting on " + names.slice(0, 2).join(", ");
+    var text = "overlaps with " + names.slice(0, 2).join(", ");
     if (names.length > 2) text += " and " + (names.length - 2) + " more";
     return text;
   }
 
-  function waitingTitle(blockers) {
-    return blockers
-      .map(function (blocker) {
-        return blocker.agent_id + (blocker.path ? " holds " + blocker.path : "");
+  function overlapTitle(overlaps) {
+    return overlaps
+      .map(function (overlap) {
+        return overlap.agent_id + " is editing " + overlap.path;
       })
       .join("\n");
-  }
-
-  // The freshest call each session made in each worktree, so a live card can
-  // show whether its agent's last word was "blocked". Self-clearing: the next
-  // granted announce becomes the latest event and the note disappears.
-  function latestEventsByTask(state) {
-    var latest = new Map();
-    eventEntries(state).forEach(function (entry) {
-      var key = taskKey(entry.machine, entry.event.agent_id, entry.event.worktree_root);
-      if (!latest.has(key)) latest.set(key, entry.event);
-    });
-    return latest;
   }
 
   // === Recent tasks ===
@@ -608,11 +663,8 @@
           waiting_on: null,
           // Whether a stopped session was heard from again afterwards.
           resumed: false,
-          // Whether this session ever announced anything but planning here.
-          edited: false,
         };
       }
-      if (event.agent_state !== "planning") task.edited = true;
       if (event.agent_state === "done" || event.agent_state === "stopped") {
         task.outcome = event.agent_state === "stopped" ? "stopped" : "released";
         task.reason = event.reason || null;
@@ -643,12 +695,7 @@
     // crosses the boundary, which is close enough for orientation.
     var cutoff = now() - RECENT_WINDOW_MS;
     return tasks.filter(function (task) {
-      if (task.ended_at_ms < cutoff) return false;
-      // A session that only ever planned and then let its lease lapse
-      // changed nothing and left nothing behind, so it is not recent work.
-      // One that planned and said done or stopped reported an outcome, and
-      // that is worth keeping whether or not it wrote a file.
-      return task.edited || task.outcome !== "expired";
+      return task.ended_at_ms >= cutoff;
     });
   }
 
@@ -850,8 +897,8 @@
    * Worktrees are where agents actually collide: two sessions in one
    * checkout edit the same files, while two worktrees of the same project
    * are independent. Grouping by (machine, worktree_root) mirrors the
-   * arbitration boundary the server already uses — the same absolute path
-   * on two machines is two different checkouts.
+   * boundary the server's PATH_OVERLAP warning uses, and the same absolute
+   * path on two machines is two different checkouts.
    */
   function groupEntriesByWorktree(entries) {
     var order = [];
@@ -1118,7 +1165,7 @@
         worktree.entries.length + " agents in this worktree"
       );
       shared.title =
-        "These agents share one checkout, so they edit the same files. Claimed scopes are what keeps them apart.";
+        "These agents share one checkout, so they edit the same files. Each card lists the paths its agent said it is editing.";
       head.appendChild(shared);
     }
     return head;
@@ -1129,17 +1176,11 @@
    * carries its branch, path, and any shared-checkout warning, so the card
    * drops those rather than repeating them on every row.
    */
-  function renderCard(entry, sameWorktree, latestEvent, grouped, sharedIdentity) {
+  function renderCard(entry, sameWorktree, overlaps, grouped, sharedIdentity) {
     var lease = entry.lease;
     var homeDir = entry.homeDir;
     var cardClass = sharedIdentity ? "card agent-cluster-card" : "card";
     var card = el("article", cardClass);
-    var testing = lease.agent_state === "testing";
-    var planning = lease.agent_state === "planning";
-    // Neither advisory state holds a lock, so both drop the language of
-    // claims; they differ in what the paths mean, which the labels below say.
-    var advisory = testing || planning;
-    card.setAttribute("data-state", advisory ? lease.agent_state : "working");
     var label = lease.agent_label || lease.agent_id || "Agent";
     // The visible identity lives once on the cluster head; name each article
     // as well so article navigation retains the agent/app/machine context.
@@ -1183,30 +1224,14 @@
       content.appendChild(bubble);
     }
 
-    // The agent's last call came back blocked or partial, so it is waiting on
-    // (or working around) another agent's claim. Read off the recorded event,
-    // not self-reported, and gone the moment a later call is granted.
-    if (
-      latestEvent &&
-      (latestEvent.status === "blocked" || latestEvent.status === "partial") &&
-      (latestEvent.blockers || []).length > 0
-    ) {
-      var waiting = el("div", "waiting-note");
-      waiting.setAttribute("data-status", latestEvent.status);
-      waiting.title = waitingTitle(latestEvent.blockers);
-      waiting.appendChild(
-        el(
-          "span",
-          null,
-          waitingText(latestEvent.blockers) +
-            (latestEvent.status === "partial" ? " for some scopes" : "")
-        )
-      );
-      content.appendChild(waiting);
+    if (overlaps.length > 0) {
+      var overlapNote = el("div", "overlap-note");
+      overlapNote.title = overlapTitle(overlaps);
+      overlapNote.appendChild(el("span", null, overlapText(overlaps)));
+      content.appendChild(overlapNote);
     }
 
     var meta = el("div", "meta");
-    if (advisory) meta.appendChild(el("span", "agent-state", lease.agent_state));
     if (lease.branch && !grouped) meta.appendChild(el("span", "mono", lease.branch));
     if (lease.worktree_root && !grouped) {
       meta.appendChild(el("span", "mono path", abbreviate(lease.worktree_root, homeDir)));
@@ -1230,8 +1255,8 @@
     }
     if (meta.childNodes.length > 0) content.appendChild(meta);
 
-    var paths = lease.dirty_paths || [];
-    if (lease.claims.length > 0 || paths.length > 0) {
+    var changedPaths = lease.dirty_paths || [];
+    if (lease.paths.length > 0 || changedPaths.length > 0) {
       var key =
         (entry.machine || "") + "\u0000" + lease.agent_id + "\u0000" + lease.worktree_root;
       var details = el("details", "agent-details");
@@ -1243,34 +1268,13 @@
       });
 
       var disclosure = el("summary");
-      if (lease.claims.length > 0) {
+      if (lease.paths.length > 0) {
         disclosure.appendChild(
-          el(
-            "span",
-            null,
-            lease.claims.length + " scope" + (lease.claims.length === 1 ? "" : "s")
-          )
+          el("span", null, lease.paths.length + " path" + (lease.paths.length === 1 ? "" : "s"))
         );
-        var exclusiveCount = lease.claims.filter(function (claim) {
-          return claim.access === "exclusive";
-        }).length;
-        // A testing agent holds no locks, so its paths are an
-        // advertisement of what a failing run would blame, not a claim; a
-        // planning agent's are only where it is currently reading.
-        if (advisory) {
-          disclosure.appendChild(el("span", null, "not blocking"));
-        } else if (exclusiveCount > 0) {
-          disclosure.appendChild(
-            el(
-              "span",
-              "exclusive-count",
-              exclusiveCount + " exclusive"
-            )
-          );
-        }
       }
-      if (paths.length > 0) {
-        var changedPathCount = paths.length + (lease.dirty_paths_truncated || 0);
+      if (changedPaths.length > 0) {
+        var changedPathCount = changedPaths.length + (lease.dirty_paths_truncated || 0);
         disclosure.appendChild(
           el(
             "span",
@@ -1281,32 +1285,18 @@
       }
       details.appendChild(disclosure);
 
-      if (lease.claims.length > 0) {
-        var claimsSection = el("div", "detail-section");
-        claimsSection.appendChild(
-          el(
-            "p",
-            "detail-label",
-            planning ? "Areas being read" : testing ? "Scopes under test" : "Claimed scopes"
-          )
-        );
-        var badges = el("div", "badges");
-        lease.claims.forEach(function (claim) {
-          var badge = el("span", "badge");
-          badge.setAttribute("data-access", claim.access === "exclusive" ? "exclusive" : "shared");
-          badge.appendChild(el("span", "mono", claim.path));
-          badge.appendChild(el("span", "access", claim.access));
-          badges.appendChild(badge);
-        });
-        claimsSection.appendChild(badges);
-        details.appendChild(claimsSection);
+      if (lease.paths.length > 0) {
+        var editingSection = el("div", "detail-section");
+        editingSection.appendChild(el("p", "detail-label", "Editing"));
+        editingSection.appendChild(renderPaths(lease.paths, 0));
+        details.appendChild(editingSection);
       }
 
-      if (paths.length > 0) {
-        var pathsSection = el("div", "detail-section");
-        pathsSection.appendChild(el("p", "detail-label", "Changed paths"));
-        pathsSection.appendChild(renderPaths(paths, lease.dirty_paths_truncated));
-        details.appendChild(pathsSection);
+      if (changedPaths.length > 0) {
+        var changedSection = el("div", "detail-section");
+        changedSection.appendChild(el("p", "detail-label", "Changed paths"));
+        changedSection.appendChild(renderPaths(changedPaths, lease.dirty_paths_truncated));
+        details.appendChild(changedSection);
       }
       content.appendChild(details);
     }
@@ -1321,7 +1311,12 @@
     var entries = visibleLeases(state);
     var groups = groupByRepo(entries);
     var sessionClusters = countSessionClusters(entries);
-    var latestEvents = latestEventsByTask(state);
+    // Overlaps are found across every live agent, not just the filtered
+    // ones, so a filter never hides who else is in a card's checkout.
+    var overlapsByEntry = new Map();
+    entries.forEach(function (entry) {
+      overlapsByEntry.set(entry, overlapsFor(entry, allEntries));
+    });
     var tasksByRepo = groupTasksByRepo(visibleTasks(state));
     var recentCount = 0;
     tasksByRepo.forEach(function (tasks) {
@@ -1346,14 +1341,16 @@
         fragment.appendChild(el("p", "empty", "No active agents match this filter."));
       }
     } else {
-      var exclusiveCount = entries.reduce(function (total, entry) {
-        return (
-          total +
-          entry.lease.claims.filter(function (claim) {
-            return claim.access === "exclusive";
-          }).length
-        );
-      }, 0);
+      var overlapCount = entries.filter(function (entry) {
+        return overlapsByEntry.get(entry).length > 0;
+      }).length;
+      var overlapCopy =
+        overlapCount === 0
+          ? "no overlapping edits."
+          : overlapCount +
+            " agent" +
+            (overlapCount === 1 ? "" : "s") +
+            " editing overlapping paths.";
       var machineCount = new Set(
         entries.map(function (entry) {
           return entry.machine || "";
@@ -1377,23 +1374,13 @@
           " active agent" +
           (allEntries.length === 1 ? "" : "s") +
           ", with " +
-          (exclusiveCount === 0
-            ? "no exclusive scopes claimed."
-            : exclusiveCount +
-              " exclusive scope" +
-              (exclusiveCount === 1 ? "" : "s") +
-              " claimed.")
+          overlapCopy
         : groups.length +
           " repositor" +
           (groups.length === 1 ? "y" : "ies") +
           (machineCount > 1 ? " across " + machineCount + " machines" : "") +
           " in view, with " +
-        (exclusiveCount === 0
-          ? "no exclusive scopes claimed."
-          : exclusiveCount +
-            " exclusive scope" +
-            (exclusiveCount === 1 ? "" : "s") +
-            " claimed.");
+          overlapCopy;
       groups.forEach(function (group) {
         var section = el("section", "group");
         var head = el("div", "group-head");
@@ -1447,9 +1434,7 @@
                 renderCard(
                   entry,
                   clusterKey !== null && (sessionClusters.get(clusterKey) || 0) > 1,
-                  latestEvents.get(
-                    taskKey(entry.machine, entry.lease.agent_id, entry.lease.worktree_root)
-                  ),
+                  overlapsByEntry.get(entry),
                   tiered,
                   sharedIdentity
                 )
@@ -1495,58 +1480,10 @@
   // === Activity view ===
 
   function activityStatus(event) {
-    if (event.agent_state === "done") return "claims released";
-    if (event.agent_state === "stopped") return "stopped unfinished, claims released";
-    // A testing agent keeps its lease but stops locking files, so the
-    // scope counts below would read as claims it no longer holds.
-    if (event.agent_state === "testing") return "verifying, claims released";
-    // A planner never claims, so it never blocks and is never blocked: the
-    // scope counts below describe reading, not a hold on anything.
-    if (event.agent_state === "planning") return "planning, nothing claimed";
-    if (event.requested_scope_count === 0) return "listening only";
-    // Recorded blocker identity turns "an active claim" into a name.
-    var blockers = event.blockers || [];
-    if (event.status === "partial") {
-      return blockers.length > 0 ? "partly blocked, " + waitingText(blockers) : "some scopes blocked";
-    }
-    if (event.status === "blocked") {
-      return blockers.length > 0 ? "blocked, " + waitingText(blockers) : "blocked by an active claim";
-    }
-    return "no known conflict";
-  }
-
-  function activityScopes(event) {
-    if (
-      event.agent_state === "done" ||
-      event.agent_state === "stopped" ||
-      event.agent_state === "testing" ||
-      event.agent_state === "planning"
-    ) {
-      return null;
-    }
-    if (event.requested_scope_count === 0) return null;
-    if (event.status === "partial") {
-      return (
-        event.granted_scope_count +
-        " clear · " +
-        event.blocked_scope_count +
-        " blocked"
-      );
-    }
-    if (event.status === "blocked") {
-      return (
-        event.blocked_scope_count +
-        " scope" +
-        (event.blocked_scope_count === 1 ? "" : "s") +
-        " in conflict"
-      );
-    }
-    return (
-      event.granted_scope_count +
-      " scope" +
-      (event.granted_scope_count === 1 ? "" : "s") +
-      " claimed"
-    );
+    if (event.agent_state === "done") return "finished";
+    if (event.agent_state === "stopped") return "stopped unfinished";
+    if (event.path_count === 0) return "no paths named";
+    return "editing " + event.path_count + " path" + (event.path_count === 1 ? "" : "s");
   }
 
   function renderActivity(state) {
@@ -1640,13 +1577,9 @@
             ? "completed work"
             : event.agent_state === "stopped"
               ? "stopped work"
-              : event.agent_state === "testing"
-                ? "started testing"
-                : event.agent_state === "planning"
-                  ? "started planning"
-                  : event.event_type === "renewed"
-                    ? "checked in again"
-                    : "announced work"
+              : event.event_type === "renewed"
+                ? "checked in again"
+                : "announced work"
         )
       );
       origin.appendChild(el("span", null, "in"));
@@ -1667,13 +1600,8 @@
           ? "completed"
           : event.agent_state === "stopped"
             ? "stopped"
-            : event.agent_state === "testing"
-              ? "testing"
-              : event.agent_state === "planning"
-                ? "planning"
-                : event.status
+            : "working"
       );
-      if ((event.blockers || []).length > 0) status.title = waitingTitle(event.blockers);
       outcome.appendChild(status);
       if (event.agent_state === "stopped" && event.reason) {
         outcome.appendChild(
@@ -1687,8 +1615,6 @@
           )
         );
       }
-      var scopeText = activityScopes(event);
-      if (scopeText) outcome.appendChild(el("span", null, scopeText));
       outcome.appendChild(
         el(
           "span",
@@ -1843,7 +1769,7 @@
         // between the browser and the announcing agents cannot make a
         // live lease look expired.
         clockOffsetMs = state.now_ms - Date.now();
-        latestState = state;
+        latestState = normalizeState(state);
         lastSuccessMs = Date.now();
         failing = false;
         liveEl.setAttribute("data-state", "ok");

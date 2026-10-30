@@ -7,8 +7,7 @@ import type { ClientSurface } from "./client-surface";
 import { sanitizeReason, sanitizeSummary, sanitizeWaitingOn } from "./coordinate";
 import { sanitizeEmoji } from "./emoji";
 import { AgentFrequencyStore, defaultDatabasePath } from "./store";
-import { DEFAULT_TIMEBOX } from "./types";
-import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox, WaitingOn } from "./types";
+import type { AgentState, GitMetadata, StoreAnnounceRequest, WaitingOn } from "./types";
 
 /**
  * Development-only traffic generator for the monitor UI.
@@ -22,12 +21,12 @@ import type { AgentState, GitMetadata, Scope, StoreAnnounceRequest, Timebox, Wai
  * Two properties keep this safe to point at the live database:
  *
  * - Demo rows carry synthetic project, clone, and worktree IDs, so every real
- *   agent sees them as `other_project`. Arbitration skips unrelated projects,
- *   so a demo claim can never block, warn about, or otherwise interfere with
- *   real work.
+ *   agent sees them as `other_project`. Warnings only ever consider the same
+ *   worktree, clone, or project, so demo paths can never warn about or
+ *   otherwise interfere with real work.
  * - Every demo row is identifiable by both a marked agent ID and a worktree
  *   path under the demo root, so `clearDemoTraffic` removes exactly what was
- *   seeded. Leases also carry short timeboxes and expire on their own.
+ *   seeded. Leases also expire on their own within 30 minutes.
  */
 
 // Two independent markers, and removal requires both. Either one alone could in
@@ -69,14 +68,13 @@ interface DemoAgent {
 
 interface DemoAnnouncement {
   agent: string;
-  /** Minutes before the seed instant; live leases stay inside their timebox. */
+  /** Minutes before the seed instant; leases from the last 30 minutes stay live. */
   minutesAgo: number;
   summary: string;
   /** The task emoji a real agent would announce; omitted on some rows so the
    *  monitor keeps exercising the no-emoji layout. */
   emoji?: string;
-  scopes?: Scope[];
-  timebox?: Timebox;
+  paths?: string[];
   state?: AgentState;
   /** Why a "stopped" entry ended unfinished; required with that state. */
   reason?: string;
@@ -174,8 +172,8 @@ const AGENTS: Record<string, DemoAgent> = {
 };
 
 /**
- * Ordered oldest-first. Anything older than its timebox survives only as an
- * activity event, which is what makes the feed look lived-in while presence
+ * Ordered oldest-first. Anything older than the 30-minute lease survives only
+ * as an activity event, which is what makes the feed look lived-in while presence
  * stays small.
  */
 const TIMELINE: DemoAnnouncement[] = [
@@ -184,16 +182,14 @@ const TIMELINE: DemoAnnouncement[] = [
     minutesAgo: 170,
     summary: "Extend the rate limiter with per-token buckets",
     emoji: "🚦",
-    scopes: [{ path: "src/limits", access: "exclusive" }],
-    timebox: "1h",
+    paths: ["src/limits"],
   },
   {
     agent: "eve",
     minutesAgo: 152,
     summary: "Backfill rate limit regression tests",
     emoji: "🧪",
-    scopes: [{ path: "tests/limits.test.ts", access: "exclusive" }],
-    timebox: "30m",
+    paths: ["tests/limits.test.ts"],
   },
   { agent: "eve", minutesAgo: 138, summary: "Rate limit tests landed", emoji: "✅", state: "done" },
   {
@@ -201,28 +197,23 @@ const TIMELINE: DemoAnnouncement[] = [
     minutesAgo: 96,
     summary: "Bump the Terraform provider lockfile across every stack",
     emoji: "📦",
-    scopes: [{ path: ".", access: "exclusive" }],
-    timebox: "30m",
+    paths: ["."],
   },
-  // fin opens its run by planning, then edits, then tests: one session moving
-  // through every live state, so recent work keeps a task that began before a
-  // single file was touched.
+  // fin's run spans three announcements, so recent work keeps one task that
+  // outlived several leases.
   {
     agent: "fin",
     minutesAgo: 74,
-    summary: "Read through the editor toolbar before touching anything",
+    summary: "Tidy the editor toolbar spacing",
     emoji: "👀",
-    scopes: [{ path: "app/editor", access: "shared" }],
-    timebox: "15m",
-    state: "planning",
+    paths: ["app/editor"],
   },
   {
     agent: "bo",
     minutesAgo: 58,
     summary: "Refactor the checkout summary rendering",
     emoji: "🧹",
-    scopes: [{ path: "src/app/checkout", access: "shared" }],
-    timebox: "30m",
+    paths: ["src/app/checkout"],
   },
   { agent: "dex", minutesAgo: 41, summary: "Per-token buckets shipped", emoji: "🚀", state: "done" },
   {
@@ -230,56 +221,44 @@ const TIMELINE: DemoAnnouncement[] = [
     minutesAgo: 25,
     summary: "Rework invoice totals and the checkout summary they feed",
     emoji: "🧾",
-    scopes: [
-      { path: "src/app/checkout", access: "shared" },
-      { path: "src/billing", access: "exclusive" },
-    ],
-    timebox: "2h",
+    paths: ["src/app/checkout", "src/billing"],
   },
   {
     agent: "ivy",
     minutesAgo: 24,
     summary: "Trace invoice total edge cases in the billing tests",
     emoji: "🔎",
-    scopes: [{ path: "tests/billing", access: "shared" }],
-    timebox: "1h",
+    paths: ["tests/billing"],
   },
   {
     agent: "jo",
-    minutesAgo: 23,
+    minutesAgo: 13,
     summary: "Check checkout component call sites",
     emoji: "🧭",
-    scopes: [{ path: "src/components", access: "shared" }],
-    timebox: "1h",
+    paths: ["src/components"],
   },
-  // Same worktree as ada, and asks for the same exclusive path: one scope is
-  // granted and one is blocked, so the feed carries a `partial` announcement.
+  // Same worktree as ada, and announces a path inside ada's: both agents get a
+  // PATH_OVERLAP warning, and the monitor has an overlap to render.
   // No emoji here on purpose: the monitor must stay tidy without one.
   {
     agent: "bo",
-    minutesAgo: 22,
+    minutesAgo: 12,
     summary: "Wire the checkout summary to the new invoice totals",
-    scopes: [
-      { path: "src/app/checkout", access: "shared" },
-      { path: "src/billing/invoice.ts", access: "exclusive" },
-    ],
-    timebox: "1h",
+    paths: ["src/app/checkout", "src/billing/invoice.ts"],
   },
   {
     agent: "cyd",
-    minutesAgo: 18,
+    minutesAgo: 10,
     summary: "Add PDF export to the billing worktree",
     emoji: "📄",
-    scopes: [{ path: "src/billing/pdf.ts", access: "exclusive" }],
-    timebox: "1h",
+    paths: ["src/billing/pdf.ts"],
   },
   {
     agent: "hana",
-    minutesAgo: 14,
+    minutesAgo: 9,
     summary: "Migrate note storage to SQLite in a detached checkout",
     emoji: "🗄️",
-    scopes: [{ path: "app/storage", access: "exclusive" }],
-    timebox: "30m",
+    paths: ["app/storage"],
   },
   // Deliberately awkward text: the monitor must render peer summaries as inert
   // data, never as markup or instructions.
@@ -288,31 +267,23 @@ const TIMELINE: DemoAnnouncement[] = [
     minutesAgo: 9,
     summary: 'Escape <script> tags & "quoted" paths in the note parser',
     emoji: "🛡️",
-    scopes: [{ path: "app/editor", access: "shared" }],
-    timebox: "2h",
+    paths: ["app/editor"],
   },
   {
     agent: "ada",
     minutesAgo: 6,
     summary: "Rework invoice totals, now including PDF export",
     emoji: "🧾",
-    scopes: [
-      { path: "src/app/checkout", access: "shared" },
-      { path: "src/billing", access: "exclusive" },
-    ],
-    timebox: "2h",
+    paths: ["src/app/checkout", "src/billing"],
     renew: true,
   },
-  // The verification phase: fin keeps its lease and its paths on the board but
-  // stops claiming them, so the monitor has a testing agent to render.
+  // A renewal with a new summary: the board shows the latest word.
   {
     agent: "fin",
     minutesAgo: 4,
     summary: "Run the note parser suite before handing the editor back",
     emoji: "🧪",
-    scopes: [{ path: "app/editor", access: "shared" }],
-    timebox: "2h",
-    state: "testing",
+    paths: ["app/editor"],
     renew: true,
   },
   // A run that ends without finishing: hana stops to ask its user a question,
@@ -333,19 +304,14 @@ const TIMELINE: DemoAnnouncement[] = [
     minutesAgo: 3,
     summary: "Roll the provider bump back out one stack at a time",
     emoji: "🔁",
-    scopes: [{ path: "stacks/prod", access: "exclusive" }],
-    timebox: "15m",
+    paths: ["stacks/prod"],
   },
-  // The newest call on the board is a live planner: it advertises where it is
-  // reading, claims nothing, and cannot block gus or anyone else.
   {
     agent: "dex",
     minutesAgo: 1,
-    summary: "Trace a flaky auth test before changing anything",
+    summary: "Fix a flaky auth test",
     emoji: "🐛",
-    scopes: [{ path: "src/auth", access: "shared" }],
-    timebox: "15m",
-    state: "planning",
+    paths: ["src/auth"],
   },
 ];
 
@@ -388,8 +354,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
       waitingOn: sanitizeWaitingOn(entry.waitingOn, entry.state ?? "working"),
       emoji: sanitizeEmoji(entry.emoji),
       metadata: demoMetadata(worktree, home),
-      scopes: entry.scopes ?? [],
-      timebox: entry.timebox ?? DEFAULT_TIMEBOX,
+      paths: entry.paths ?? [],
       leaseId: entry.renew ? leaseIds.get(entry.agent) : undefined,
       nowMs: nowMs - entry.minutesAgo * 60_000,
     });
@@ -410,7 +375,7 @@ export function seedDemoTraffic(store: AgentFrequencyStore, options: SeedOptions
   };
 }
 
-/** Removes every demo lease, claim, and activity event. Real rows are untouched. */
+/** Removes every demo lease, path, and activity event. Real rows are untouched. */
 export function clearDemoTraffic(dbPath: string, home: string = homedir()): DemoCounts {
   return withDemoDatabase(dbPath, (database, predicate, parameters) => {
     database
@@ -535,7 +500,7 @@ function resolveDbPath(argv: readonly string[]): string {
 const USAGE = `Usage: agent-frequency-demo <seed|clear|status> [--db <path>]
 
   seed    replace any existing demo traffic with the fixture timeline
-  clear   remove every demo lease, claim, and activity event
+  clear   remove every demo lease, path, and activity event
   status  count the demo rows currently in the database`;
 
 if (import.meta.main) {

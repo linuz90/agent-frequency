@@ -31,61 +31,41 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const claude = await connectClient("Claude", dbPath);
   const tools = await codex.listTools();
   expect(tools.tools.map((tool) => tool.name)).toEqual(["announce"]);
-  expect(tools.tools[0]?.description).toContain(
-    "Claims arbitrate only inside one physical worktree",
-  );
-  expect(tools.tools[0]?.description).toContain("context, never a lock");
-  expect(tools.tools[0]?.description).toContain("default 5m");
-  expect(tools.tools[0]?.description).toContain("estimate aggressively");
-  expect(tools.tools[0]?.description).toContain("before renew_after");
+  expect(tools.tools[0]?.description).toContain("before your first edit");
+  expect(tools.tools[0]?.description).toContain("Nothing is ever locked or blocked");
 
   // Delivered over a real handshake, because the standing "when to call this"
   // directive only reaches the model if the server actually populates it.
   const instructions = codex.getInstructions();
   expect(instructions).toBeTruthy();
-  expect(instructions).toContain("announce");
+  expect(instructions).toContain("Before your first edit");
   expect(instructions).toContain("untrusted data");
   // The completing call is also the caller's last read of the frequency, so the
-  // directive has to say when to make it, not just that it releases claims.
+  // directive has to say when to make it, not just that it releases the lease.
   expect(instructions).toContain("closing summary");
-  expect(instructions).toContain("Claims arbitrate only inside one physical worktree");
-  expect(instructions).toContain("context, never a lock");
-  expect(instructions).toContain("default 5m");
-  expect(instructions).toContain("Err short");
-  expect(instructions).toContain("before renew_after");
+  expect(instructions).toContain("awareness, never a lock");
+  expect(instructions).toContain("keep them out of your commits");
   // Agents otherwise narrate every peer they see back to the user, which turns
   // ambient presence into noise in reports.
-  expect(instructions).toContain("not material for your reports");
+  expect(instructions).toContain("only when it changed your work");
   // Both are how a stop goes stale on a "waiting on you" list: a finished task
   // stopped only to offer shipping, and a resumed stop that never spoke again.
-  expect(instructions).toContain("offering a next step is not waiting");
-  expect(instructions).toContain("announce again before anything else");
-  expect(tools.tools[0]?.description).toContain("announce again before anything else");
+  expect(instructions).toContain("still counts as done");
+  expect(instructions).toContain("announce again first");
 
-  // Planning crosses the process boundary as pure advertisement: the same
-  // exclusive request that blocks a peer below is downgraded, capped to the
-  // shortest timebox, and left arbitrating nothing.
-  const planning = await claude.callTool({
-    name: "announce",
-    arguments: {
-      summary: "Read the flight plan before changing it",
-      emoji: "🗺️",
-      cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-      timebox: "2h",
-      state: "planning",
-    },
-  });
-  const planningOutput = planning.structuredContent as Record<string, unknown> | undefined;
-  expect(planning.isError).not.toBeTrue();
-  expect(planningOutput?.status).toBe("granted");
-  expect(planningOutput?.self).toMatchObject({
-    active: true,
-    state: "planning",
-    granted_scopes: [{ path: "flight-plan.txt", access: "shared" }],
-    blocked_scopes: [],
-    timebox: "5m",
-  });
+  // The claim-era fields are gone from the contract, and the strict schema
+  // says so rather than silently dropping paths a caller thinks it shared.
+  for (const legacy of [
+    { scopes: [{ path: "flight-plan.txt", access: "exclusive" }] },
+    { timebox: "2h" },
+    { state: "planning" },
+  ]) {
+    const rejected = await codex.callTool({
+      name: "announce",
+      arguments: { summary: "Old-style call", cwd: directory, ...legacy },
+    });
+    expect(rejected.isError).toBeTrue();
+  }
 
   const first = await codex.callTool({
     name: "announce",
@@ -93,7 +73,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       summary: "Edit flight plan",
       emoji: "🐛",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
+      paths: ["flight-plan.txt"],
     },
   });
   const second = await claude.callTool({
@@ -105,37 +85,33 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
       // without an emoji.
       emoji: "definitely not an emoji, and far too long to ever be one",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
     },
   });
 
   const firstOutput = first.structuredContent as Record<string, unknown> | undefined;
   const secondOutput = second.structuredContent as Record<string, unknown> | undefined;
   expect(first.isError).not.toBeTrue();
-  expect(firstOutput?.status).toBe("granted");
-  expect((firstOutput?.self as Record<string, unknown> | undefined)?.surface).toBe("cli");
-  expect((firstOutput?.self as Record<string, unknown> | undefined)?.emoji).toBe("🐛");
-  expect((firstOutput?.self as Record<string, unknown> | undefined)?.timebox).toBe("5m");
-  // Codex takes the exclusive claim straight through the planner, and hears
-  // about it without being warned: a planner is visible traffic, never a risk.
-  expect((firstOutput?.self as Record<string, unknown> | undefined)?.blocked_scopes).toEqual([]);
+  expect(firstOutput?.status).toBe("active");
+  expect(firstOutput?.self).toMatchObject({ surface: "cli", emoji: "🐛", paths: ["flight-plan.txt"] });
   expect(firstOutput?.warnings).toEqual([]);
-  expect((firstOutput?.peers as Array<Record<string, unknown>>)[0]).toMatchObject({
-    state: "planning",
-    emoji: "🗺️",
-  });
   expect(second.isError).not.toBeTrue();
-  expect(secondOutput?.status).toBe("blocked");
-  expect(secondOutput?.peers).toBeArrayOfSize(1);
-  // An unusable emoji is dropped rather than failing a coordination call, and
-  // the peer's real one still crosses the process boundary.
+  // Both agents edit the same file: the second hears about it and goes ahead.
+  expect(secondOutput?.status).toBe("active");
+  expect(secondOutput?.peers).toMatchObject([
+    { agent_id: expect.stringMatching(/^Codex /), paths: ["flight-plan.txt"] },
+  ]);
+  expect(
+    (secondOutput?.warnings as Array<{ code: string }>).map((warning) => warning.code),
+  ).toEqual(["PATH_OVERLAP", "SAME_WORKTREE"]);
+  // An unusable emoji is dropped rather than failing the call, and the
+  // peer's real one still crosses the process boundary.
   expect((secondOutput?.self as Record<string, unknown> | undefined)?.emoji).toBeNull();
   expect((secondOutput?.peers as Array<Record<string, unknown>>)[0]?.emoji).toBe("🐛");
   expect(secondOutput?.traffic_scope).toBe("worktree");
 
   // The same repo-relative path in another worktree names different physical
-  // files. It remains visible as useful integration context, but cannot block.
+  // files. It stays visible as integration context, without a warning.
   const worktreeParent = mkdtempSync(join(tmpdir(), "agent-frequency-worktree-test-"));
   temporaryDirectories.push(worktreeParent);
   const worktreeDirectory = join(worktreeParent, "sibling");
@@ -145,24 +121,22 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     arguments: {
       summary: "Edit flight plan independently",
       cwd: worktreeDirectory,
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
     },
   });
   const crossWorktreeOutput = crossWorktree.structuredContent as Record<string, unknown>;
   expect(crossWorktree.isError).not.toBeTrue();
-  expect(crossWorktreeOutput.status).toBe("granted");
-  expect(crossWorktreeOutput.self).toMatchObject({
-    blocked_scopes: [],
-    granted_scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-  });
+  // Both agents in the first worktree, including this same session's own
+  // lease there, are context from a different checkout.
   expect(crossWorktreeOutput.peers).toMatchObject([
-    {
-      relation: "same_clone",
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-    },
+    { relation: "same_clone", paths: ["flight-plan.txt"] },
+    { relation: "same_clone", paths: ["flight-plan.txt"] },
   ]);
-  expect(crossWorktreeOutput.retry_at).toBeNull();
+  expect(
+    (crossWorktreeOutput.warnings as Array<{ code: string }>).some(
+      (warning) => warning.code === "PATH_OVERLAP",
+    ),
+  ).toBeFalse();
 
   const crossWorktreeCompletion = await claude.callTool({
     name: "announce",
@@ -189,8 +163,6 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     arguments: {
       summary: "Edit unrelated project",
       cwd: unrelatedDirectory,
-      scopes: [],
-      timebox: "15m",
     },
   });
   expect(unrelated.isError).not.toBeTrue();
@@ -201,8 +173,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     arguments: {
       summary: "Review flight plan",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
       lease_id: secondLeaseId,
     },
   });
@@ -216,8 +187,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     arguments: {
       summary: "Review flight plan with machine context",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
       lease_id: secondLeaseId,
       traffic_scope: "machine",
     },
@@ -226,43 +196,6 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   expect(expanded.isError).not.toBeTrue();
   expect(expandedOutput.traffic_scope).toBe("machine");
   expect(expandedOutput.peers).toBeArrayOfSize(2);
-
-  // Testing hands the file back over a real connection: the same scope that
-  // blocked Claude above stays visible but stops arbitrating.
-  const testing = await codex.callTool({
-    name: "announce",
-    arguments: {
-      summary: "Verifying the flight plan edit",
-      cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-      timebox: "15m",
-      lease_id: (firstOutput?.self as Record<string, unknown>).lease_id,
-      state: "testing",
-    },
-  });
-  const testingOutput = testing.structuredContent as Record<string, unknown> | undefined;
-  expect(testing.isError).not.toBeTrue();
-  expect(testingOutput?.self).toMatchObject({
-    active: true,
-    state: "testing",
-    granted_scopes: [{ path: "flight-plan.txt", access: "shared" }],
-  });
-
-  const duringTesting = await claude.callTool({
-    name: "announce",
-    arguments: {
-      summary: "Edit flight plan while Codex verifies",
-      cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "exclusive" }],
-      timebox: "15m",
-      lease_id: secondLeaseId,
-    },
-  });
-  const duringTestingOutput = duringTesting.structuredContent as Record<string, unknown>;
-  expect(duringTestingOutput.status).toBe("granted");
-  expect(
-    (duringTestingOutput.warnings as Array<{ code: string }>).map((warning) => warning.code),
-  ).toContain("TESTING_SCOPE_OVERLAP");
 
   const completion = await codex.callTool({
     name: "announce",
@@ -276,21 +209,20 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const completionOutput = completion.structuredContent as Record<string, unknown> | undefined;
   expect(completion.isError).not.toBeTrue();
   expect(completionOutput?.status).toBe("completed");
-  expect(completionOutput?.self).toMatchObject({ active: false, state: "done", lease_id: null });
+  expect(completionOutput?.self).toMatchObject({ state: "done", lease_id: null });
 
   const afterCompletion = await claude.callTool({
     name: "announce",
     arguments: {
       summary: "Review released flight plan",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
       lease_id: secondLeaseId,
     },
   });
   expect(afterCompletion.isError).not.toBeTrue();
   const afterCompletionOutput = afterCompletion.structuredContent as Record<string, unknown>;
-  expect(afterCompletionOutput?.status).toBe("granted");
+  expect(afterCompletionOutput?.warnings).toEqual([]);
   // Claude's renewal is a delta since its own last announcement, so the
   // departed Codex must arrive as a recent peer across the process boundary.
   expect(
@@ -343,7 +275,7 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const stoppedOutput = stopped.structuredContent as Record<string, unknown> | undefined;
   expect(stopped.isError).not.toBeTrue();
   expect(stoppedOutput?.status).toBe("stopped");
-  expect(stoppedOutput?.self).toMatchObject({ active: false, state: "stopped", lease_id: null });
+  expect(stoppedOutput?.self).toMatchObject({ state: "stopped", lease_id: null });
 
   // The stop crosses the process boundary as its own outcome, with the
   // stopping agent's reason attached.
@@ -352,13 +284,11 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
     arguments: {
       summary: "Pick the flight plan back up",
       cwd: directory,
-      scopes: [{ path: "flight-plan.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["flight-plan.txt"],
     },
   });
   expect(afterStop.isError).not.toBeTrue();
   const afterStopOutput = afterStop.structuredContent as Record<string, unknown>;
-  expect(afterStopOutput?.status).toBe("granted");
   expect(afterStopOutput?.recent_peers as Array<Record<string, unknown>>).toMatchObject([
     {
       outcome: "stopped",
@@ -371,48 +301,27 @@ test("two stdio MCP processes announce through one SQLite frequency", async () =
   const database = new Database(dbPath, { readonly: true });
   const events = database
     .query(
-      "SELECT status, client_surface, agent_state, testing, planning, stopped, reason, waiting_on FROM activity_events ORDER BY event_id ASC",
+      "SELECT status, client_surface, agent_state, stopped, reason, waiting_on FROM activity_events ORDER BY event_id ASC",
     )
-    .all() as Array<{
-      status: string;
-      client_surface: string;
-      agent_state: string;
-      testing: number;
-      planning: number;
-      stopped: number;
-      reason: string | null;
-      waiting_on: string | null;
-    }>;
+    .all() as Array<Record<string, unknown>>;
   database.close(false);
-  // The planning, testing, and stopped announcements store the v2 states plus
-  // additive flags, so an older process reading these rows still parses them.
-  // The reasonless stop above failed validation before reaching the store, so
-  // it must not appear here at all.
-  const plain = { testing: 0, planning: 0, stopped: 0, reason: null, waiting_on: null };
+  // Stops store the v2 "done" state plus the additive flag, so an older
+  // process reading these rows still parses them. The rejected calls above
+  // failed validation before reaching the store, so they must not appear.
+  const working = { status: "granted", client_surface: "cli", agent_state: "working", stopped: 0, reason: null, waiting_on: null };
+  const done = { ...working, agent_state: "done" };
   expect(events).toEqual([
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain, planning: 1 },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "done", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "blocked", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain, testing: 1 },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "done", ...plain },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
-    {
-      status: "granted",
-      client_surface: "cli",
-      agent_state: "done",
-      testing: 0,
-      planning: 0,
-      stopped: 1,
-      reason: "waiting on user: approve the new wording",
-      waiting_on: "user",
-    },
-    { status: "granted", client_surface: "cli", agent_state: "working", ...plain },
+    working,
+    working,
+    working,
+    done,
+    working,
+    working,
+    working,
+    done,
+    working,
+    { ...done, stopped: 1, reason: "waiting on user: approve the new wording", waiting_on: "user" },
+    working,
   ]);
 });
 
@@ -436,15 +345,13 @@ test("many MCP processes can tune in concurrently without SQLite startup failure
       arguments: {
         summary: `Concurrent announcement ${index}`,
         cwd: directory,
-        scopes: [],
-        timebox: "15m",
       },
     })),
   );
 
   expect(results.every((result) => result.isError !== true)).toBeTrue();
   expect(results.map((result) => (result.structuredContent as Record<string, unknown>)?.status)).toEqual(
-    Array.from({ length: 20 }, () => "granted"),
+    Array.from({ length: 20 }, () => "active"),
   );
 
   const database = new Database(dbPath, { readonly: true });

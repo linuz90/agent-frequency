@@ -59,7 +59,7 @@ describe("sanitizeReason", () => {
   });
 });
 
-test("two announcements share Git-derived traffic and advisory claims", async () => {
+test("two announcements share Git-derived traffic and each other's paths", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-frequency-coordinate-test-"));
   temporaryDirectories.push(directory);
   git(directory, "init", "-q");
@@ -74,8 +74,7 @@ test("two announcements share Git-derived traffic and advisory claims", async ()
     {
       summary: "Edit the tracked file",
       cwd: directory,
-      scopes: [{ path: "tracked.txt", access: "exclusive" }],
-      timebox: "15m",
+      paths: ["tracked.txt"],
     },
     { agentId: "Codex A001", agentLabel: "Codex", clientSurface: "t3-code" },
     { dbPath, nowMs: 1_800_000_000_000 },
@@ -84,16 +83,16 @@ test("two announcements share Git-derived traffic and advisory claims", async ()
     {
       summary: "Review tracked file",
       cwd: directory,
-      scopes: [{ path: "tracked.txt", access: "shared" }],
-      timebox: "15m",
+      paths: ["./tracked.txt"],
     },
     { agentId: "Claude B002", agentLabel: "Claude", clientSurface: "claude-app" },
     { dbPath, nowMs: 1_800_000_001_000 },
   );
 
-  expect(first.status).toBe("granted");
+  expect(first.status).toBe("active");
   expect(first.self.lease_id).toMatch(/^[a-f0-9]{32}$/);
-  expect(second.status).toBe("blocked");
+  expect(second.status).toBe("active");
+  expect(second.self.paths).toEqual(["tracked.txt"]);
   expect(second.traffic_scope).toBe("worktree");
   expect(second.hidden_peers).toEqual({
     same_worktree: 0,
@@ -103,13 +102,14 @@ test("two announcements share Git-derived traffic and advisory claims", async ()
   });
   expect(first.self.surface).toBe("t3-code");
   expect(second.peers[0]?.surface).toBe("t3-code");
-  expect(second.peers.map((peer) => [peer.agent_id, peer.summary])).toEqual([
-    ["Codex A001", "Edit the tracked file"],
+  expect(second.peers.map((peer) => [peer.agent_id, peer.summary, peer.paths])).toEqual([
+    ["Codex A001", "Edit the tracked file", ["tracked.txt"]],
   ]);
+  expect(second.warnings.map((warning) => warning.code)).toContain("PATH_OVERLAP");
 });
 
-test("omitted timebox uses the shortest lease", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "agent-frequency-coordinate-timebox-test-"));
+test("a lease lasts 30 minutes and asks for a check-in after 20", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-frequency-coordinate-lease-test-"));
   temporaryDirectories.push(directory);
   git(directory, "init", "-q");
 
@@ -120,9 +120,8 @@ test("omitted timebox uses the shortest lease", async () => {
     { dbPath: join(directory, "agent-frequency.sqlite3"), nowMs },
   );
 
-  expect(result.self.timebox).toBe("5m");
-  expect(result.self.expires_at).toBe(new Date(nowMs + 5 * 60_000).toISOString());
-  expect(result.self.renew_after).toBe(new Date(nowMs + 200_000).toISOString());
+  expect(result.self.expires_at).toBe(new Date(nowMs + 30 * 60_000).toISOString());
+  expect(result.self.renew_after).toBe(new Date(nowMs + 20 * 60_000).toISOString());
 });
 
 function git(cwd: string, ...args: string[]): void {

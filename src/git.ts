@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { stripUnsafeFormatting } from "./scopes";
+import { stripUnsafeFormatting } from "./paths";
 import type { GitMetadata } from "./types";
 
 const GIT_TIMEOUT_MS = 2_000;

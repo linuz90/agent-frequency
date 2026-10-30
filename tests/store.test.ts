@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { AgentFrequencyStore } from "../src/store";
-import type { GitMetadata, Scope, StoreAnnounceRequest, Timebox } from "../src/types";
+import type { GitMetadata, StoreAnnounceRequest } from "../src/types";
 
 const stores: AgentFrequencyStore[] = [];
 const temporaryDirectories: string[] = [];
@@ -54,7 +54,7 @@ function metadata(overrides: Partial<GitMetadata> = {}): GitMetadata {
 
 function request(
   agentId: string,
-  scopes: Scope[],
+  paths: string[],
   overrides: Partial<StoreAnnounceRequest> = {},
 ): StoreAnnounceRequest {
   return {
@@ -62,8 +62,7 @@ function request(
     agentLabel: agentId,
     summary: `${agentId} work`,
     metadata: metadata(),
-    scopes,
-    timebox: "15m",
+    paths,
     nowMs: 1_800_000_000_000,
     ...overrides,
     clientSurface: overrides.clientSurface ?? "cli",
@@ -73,59 +72,32 @@ function request(
 }
 
 describe("AgentFrequencyStore.announce", () => {
-  test("grants shared overlaps and returns a deterministic warning", () => {
+  test("warns both agents about overlapping paths in one worktree and never blocks", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "shared" }]));
+    const first = store.announce(request("alpha", ["src/auth"]));
+    const second = store.announce(request("bravo", ["src/auth/token.ts"]));
 
-    const result = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }]),
-    );
-
-    expect(result.status).toBe("granted");
-    expect(result.self.granted_scopes).toEqual([
-      { path: "src/auth/token.ts", access: "shared" },
-    ]);
-    expect(result.warnings.find((warning) => warning.code === "SHARED_SCOPE_OVERLAP")).toEqual({
-      code: "SHARED_SCOPE_OVERLAP",
-      message: "Shared scopes overlap: src/auth/token.ts with alpha:src/auth",
+    expect(first.status).toBe("active");
+    expect(second.status).toBe("active");
+    expect(second.self.paths).toEqual(["src/auth/token.ts"]);
+    expect(second.warnings.find((warning) => warning.code === "PATH_OVERLAP")).toEqual({
+      code: "PATH_OVERLAP",
+      message: "Agents in this worktree are editing overlapping paths: src/auth/token.ts with alpha:src/auth",
     });
-  });
-
-  test("blocks every overlapping claim involving exclusive access", () => {
-    const store = createStore();
-    const first = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }]),
-    );
-    const second = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }]),
-    );
-
-    expect(first.status).toBe("granted");
-    expect(first.retry_at).toBeNull();
-    expect(second.status).toBe("blocked");
-    expect(second.self.granted_scopes).toEqual([]);
-    expect(second.self.blocked_scopes).toEqual([
-      {
-        path: "src/auth/token.ts",
-        access: "shared",
-        blockers: [
-          {
-            agent_id: "alpha",
-            relation: "same_worktree",
-            path: "src/auth",
-            access: "exclusive",
-            expires_at: first.self.expires_at!,
-            updated_at: new Date(1_800_000_000_000).toISOString(),
-          },
-        ],
-      },
-    ]);
-    expect(second.retry_at).toBe(first.self.expires_at!);
-    expect(second.message).toContain("re-announce these scopes to retry");
+    expect(second.message).toContain("nothing is locked");
+    expect(second.peers).toMatchObject([{ agent_id: "alpha", paths: ["src/auth"] }]);
     expect(JSON.stringify(second)).not.toContain(first.self.lease_id);
+
+    // The agent that announced first hears about the overlap on its next call.
+    const renewed = store.announce(
+      request("alpha", ["src/auth"], { leaseId: first.self.lease_id!, nowMs: 1_800_000_001_000 }),
+    );
+    expect(renewed.warnings.find((warning) => warning.code === "PATH_OVERLAP")?.message).toBe(
+      "Agents in this worktree are editing overlapping paths: src/auth with bravo:src/auth/token.ts",
+    );
   });
 
-  test("never arbitrates overlapping claims across physical worktrees", () => {
+  test("shows overlapping paths in other worktrees as context, without a warning", () => {
     for (const [relation, trafficScope, peerMetadata] of [
       [
         "same_clone",
@@ -152,61 +124,24 @@ describe("AgentFrequencyStore.announce", () => {
       ],
     ] as const) {
       const store = createStore();
-      store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+      store.announce(request("alpha", ["src/auth"]));
 
       const result = store.announce(
-        request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+        request("bravo", ["src/auth/token.ts"], {
           metadata: peerMetadata,
           trafficScope,
         }),
       );
 
-      expect(result.status).toBe("granted");
-      expect(result.self.granted_scopes).toEqual([
-        { path: "src/auth/token.ts", access: "exclusive" },
-      ]);
-      expect(result.self.blocked_scopes).toEqual([]);
-      expect(result.retry_at).toBeNull();
+      expect(result.status).toBe("active");
       expect(result.peers).toMatchObject([
         {
           agent_id: "alpha",
           relation,
-          scopes: [{ path: "src/auth", access: "exclusive" }],
+          paths: ["src/auth"],
         },
       ]);
-      expect(
-        result.warnings.some(
-          (warning) =>
-            warning.code === "SHARED_SCOPE_OVERLAP"
-            || warning.code === "TESTING_SCOPE_OVERLAP",
-        ),
-      ).toBeFalse();
-    }
-  });
-
-  test("never raises path-overlap warnings across physical worktrees", () => {
-    for (const [peerState, warningCode] of [
-      ["working", "SHARED_SCOPE_OVERLAP"],
-      ["testing", "TESTING_SCOPE_OVERLAP"],
-    ] as const) {
-      const store = createStore();
-      store.announce(
-        request("alpha", [{ path: "src/auth", access: "shared" }], { state: peerState }),
-      );
-
-      const result = store.announce(
-        request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
-          metadata: metadata({
-            worktreeId: "worktree-2",
-            worktreeRoot: "/code/example-two",
-            branch: "feature",
-          }),
-        }),
-      );
-
-      expect(result.status).toBe("granted");
-      expect(result.peers).toMatchObject([{ agent_id: "alpha", relation: "same_clone" }]);
-      expect(result.warnings.some((warning) => warning.code === warningCode)).toBeFalse();
+      expect(result.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeFalse();
     }
   });
 
@@ -230,65 +165,24 @@ describe("AgentFrequencyStore.announce", () => {
       });
   });
 
-  test("retry_at reports the latest blocker expiry across blocked scopes", () => {
+  test("renews an opaque lease with a fresh 30-minute window and replaces its paths", () => {
     const store = createStore();
-    const shortLease = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], { timebox: "15m" }),
-    );
-    const longLease = store.announce(
-      request("bravo", [{ path: "docs", access: "exclusive" }], { timebox: "2h" }),
-    );
-
-    const blocked = store.announce(
-      request("charlie", [
-        { path: "src/auth/token.ts", access: "shared" },
-        { path: "docs/readme.md", access: "shared" },
-      ]),
-    );
-
-    expect(blocked.status).toBe("blocked");
-    expect(blocked.retry_at).toBe(longLease.self.expires_at!);
-    expect(shortLease.self.expires_at! < longLease.self.expires_at!).toBeTrue();
-  });
-
-  test("persists only granted claims after a partial result", () => {
-    const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    const partial = store.announce(
-      request("bravo", [
-        { path: "src/auth/token.ts", access: "shared" },
-        { path: "docs", access: "exclusive" },
-      ]),
-    );
-
-    expect(partial.status).toBe("partial");
-    expect(partial.self.granted_scopes).toEqual([{ path: "docs", access: "exclusive" }]);
-
-    const observer = store.announce(request("charlie", []));
-    const bravo = observer.peers.find((peer) => peer.agent_id === "bravo");
-    expect(bravo?.scopes).toEqual([{ path: "docs", access: "exclusive" }]);
-  });
-
-  test("renews an opaque lease with an exact new TTL and replaces its claims", () => {
-    const store = createStore();
-    const first = store.announce(request("alpha", [{ path: "src", access: "shared" }]));
+    const first = store.announce(request("alpha", ["src"]));
     const renewalTime = 1_800_000_100_000;
     const renewed = store.announce(
-      request("alpha", [{ path: "docs", access: "exclusive" }], {
+      request("alpha", ["docs"], {
         leaseId: first.self.lease_id!,
-        timebox: "1h",
         nowMs: renewalTime,
       }),
     );
 
     expect(renewed.self.renewed).toBeTrue();
     expect(renewed.self.lease_id).toBe(first.self.lease_id);
-    expect(renewed.self.expires_at).toBe(new Date(renewalTime + 60 * 60 * 1_000).toISOString());
+    expect(renewed.self.expires_at).toBe(new Date(renewalTime + 30 * 60 * 1_000).toISOString());
+    expect(renewed.self.renew_after).toBe(new Date(renewalTime + 20 * 60 * 1_000).toISOString());
 
     const observer = store.announce(request("bravo", [], { nowMs: renewalTime }));
-    expect(observer.peers.find((peer) => peer.agent_id === "alpha")?.scopes).toEqual([
-      { path: "docs", access: "exclusive" },
-    ]);
+    expect(observer.peers.find((peer) => peer.agent_id === "alpha")?.paths).toEqual(["docs"]);
   });
 
   test("uses physical identity across process and origin changes but rejects another repository", () => {
@@ -323,35 +217,30 @@ describe("AgentFrequencyStore.announce", () => {
 
   test("physical worktree identity wins if remote-derived project identity changes", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src", access: "exclusive" }]));
+    store.announce(request("alpha", ["src"]));
 
     const result = store.announce(
-      request("bravo", [{ path: "src/file.ts", access: "shared" }], {
+      request("bravo", ["src/file.ts"], {
         metadata: metadata({ projectId: "origin-temporarily-unavailable" }),
       }),
     );
 
-    expect(result.status).toBe("blocked");
+    expect(result.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeTrue();
     expect(result.peers[0]?.relation).toBe("same_worktree");
   });
 
-  test("expires old leases before checking a new claim", () => {
+  test("expires old leases before listing peers", () => {
     const store = createStore();
     const start = 1_800_000_000_000;
-    store.announce(
-      request("alpha", [{ path: ".", access: "exclusive" }], {
-        nowMs: start,
-        timebox: "15m",
-      }),
-    );
+    store.announce(request("alpha", ["."], { nowMs: start }));
 
     const next = store.announce(
-      request("bravo", [{ path: "src", access: "exclusive" }], {
-        nowMs: start + 15 * 60 * 1_000,
+      request("bravo", ["src"], {
+        nowMs: start + 30 * 60 * 1_000,
       }),
     );
-    expect(next.status).toBe("granted");
     expect(next.peers).toEqual([]);
+    expect(next.warnings).toEqual([]);
   });
 
   test("classifies clone and project peers and warns about matching branches", () => {
@@ -389,7 +278,7 @@ describe("AgentFrequencyStore.announce", () => {
       }),
     );
     store.announce(
-      request("overlap-peer", [{ path: "Src/Auth", access: "shared" }], {
+      request("overlap-peer", ["Src/Auth"], {
         metadata: metadata({
           worktreeId: "worktree-2",
           worktreeRoot: "/code/example-two",
@@ -430,7 +319,7 @@ describe("AgentFrequencyStore.announce", () => {
     );
 
     const narrow = store.announce(
-      request("self", [{ path: "src/auth/token.ts", access: "shared" }]),
+      request("self", ["src/auth/token.ts"]),
     );
 
     expect(narrow.traffic_scope).toBe("worktree");
@@ -446,11 +335,11 @@ describe("AgentFrequencyStore.announce", () => {
       other_project: 1,
     });
     expect(narrow.peers_truncated).toBe(0);
-    expect(narrow.warnings.some((warning) => warning.code === "SHARED_SCOPE_OVERLAP")).toBeFalse();
+    expect(narrow.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeFalse();
     expect(narrow.warnings.some((warning) => warning.code === "SAME_BRANCH")).toBeTrue();
 
     const project = store.announce(
-      request("self", [{ path: "src/auth/token.ts", access: "shared" }], {
+      request("self", ["src/auth/token.ts"], {
         leaseId: narrow.self.lease_id!,
         trafficScope: "project",
         nowMs: 1_800_000_001_000,
@@ -465,7 +354,7 @@ describe("AgentFrequencyStore.announce", () => {
     expect(project.hidden_peers.other_project).toBe(1);
 
     const machine = store.announce(
-      request("self", [{ path: "src/auth/token.ts", access: "shared" }], {
+      request("self", ["src/auth/token.ts"], {
         leaseId: project.self.lease_id!,
         trafficScope: "machine",
         nowMs: 1_800_000_002_000,
@@ -486,10 +375,10 @@ describe("AgentFrequencyStore.announce", () => {
     });
   });
 
-  test("hides other projects by default without cross-project blocking", () => {
+  test("hides other projects by default", () => {
     const store = createStore();
     store.announce(
-      request("other", [{ path: ".", access: "exclusive" }], {
+      request("other", ["."], {
         metadata: metadata({
           projectId: "project-2",
           localRepoId: "clone-2",
@@ -501,21 +390,15 @@ describe("AgentFrequencyStore.announce", () => {
     );
     store.announce(request("related", [], { metadata: metadata({ worktreeId: "worktree-3" }) }));
 
-    const result = store.announce(request("self", [{ path: "src", access: "exclusive" }]));
-    expect(result.status).toBe("granted");
+    const result = store.announce(request("self", ["src"]));
     expect(result.peers.map((peer) => [peer.agent_id, peer.relation])).toEqual([
       ["related", "same_clone"],
     ]);
     expect(result.hidden_peers.other_project).toBe(1);
-    expect(result.warnings.some((warning) => warning.code === "SAME_BRANCH")).toBeTrue();
-    expect(
-      result.self.blocked_scopes.flatMap((scope) => scope.blockers).some(
-        (blocker) => blocker.agent_id === "other",
-      ),
-    ).toBeFalse();
+    expect(result.warnings.map((warning) => warning.code)).toEqual(["SAME_BRANCH"]);
 
     const expanded = store.announce(
-      request("self", [{ path: "src", access: "exclusive" }], {
+      request("self", ["src"], {
         leaseId: result.self.lease_id!,
         trafficScope: "machine",
         nowMs: 1_800_000_001_000,
@@ -570,44 +453,32 @@ describe("AgentFrequencyStore.announce", () => {
     expect(result.self.lease_id).not.toBe("00000000000000000000000000000000");
   });
 
-  test.each(["5m", "15m", "30m", "1h", "2h"] satisfies Timebox[])(
-    "uses the exact %s timebox",
-    (timebox) => {
-      const store = createStore();
-      const nowMs = 1_800_000_000_000;
-      const seconds = { "5m": 300, "15m": 900, "30m": 1_800, "1h": 3_600, "2h": 7_200 }[timebox];
-      const result = store.announce(request("alpha", [], { nowMs, timebox }));
-      expect(result.self.expires_at).toBe(new Date(nowMs + seconds * 1_000).toISOString());
-    },
-  );
-
-  test("supersedes its own stale lease instead of self-blocking when the lease ID is lost", () => {
+  test("supersedes its own stale lease instead of hearing itself when the lease ID is lost", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    store.announce(request("alpha", ["src/auth"]));
 
-    const fresh = store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    expect(fresh.status).toBe("granted");
+    const fresh = store.announce(request("alpha", ["src/auth"]));
     expect(fresh.self.renewed).toBeFalse();
     expect(fresh.peers).toEqual([]);
+    expect(fresh.warnings).toEqual([]);
 
     const observer = store.announce(request("bravo", []));
     expect(observer.peers.filter((peer) => peer.agent_id === "alpha")).toHaveLength(1);
   });
 
-  test("announces completion, releases claims, and retains a done activity event", () => {
+  test("announces completion, releases the lease, and retains a done activity event", () => {
     const { store, dbPath } = createStoreWithPath();
     const first = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }]),
+      request("alpha", ["src/auth"]),
     );
-    const blocked = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
+    store.announce(
+      request("bravo", ["src/auth/token.ts"], {
         nowMs: 1_800_000_001_000,
       }),
     );
-    expect(blocked.status).toBe("blocked");
 
     const completed = store.announce(
-      request("alpha", [{ path: "stale/claim", access: "exclusive" }], {
+      request("alpha", ["stale/claim"], {
         state: "done",
         summary: "Finished authentication work",
         leaseId: first.self.lease_id!,
@@ -618,23 +489,22 @@ describe("AgentFrequencyStore.announce", () => {
     expect(completed.status).toBe("completed");
     expect(completed.self).toMatchObject({
       lease_id: null,
-      active: false,
       state: "done",
       expires_at: null,
       renew_after: null,
-      timebox: null,
-      granted_scopes: [],
-      blocked_scopes: [],
+      paths: [],
     });
     expect(completed.peers.find((peer) => peer.agent_id === "alpha")).toBeUndefined();
-    expect(completed.peers.find((peer) => peer.agent_id === "bravo")?.state).toBe("working");
+    expect(completed.peers.find((peer) => peer.agent_id === "bravo")?.paths).toEqual([
+      "src/auth/token.ts",
+    ]);
 
     const next = store.announce(
-      request("charlie", [{ path: "src/auth", access: "exclusive" }], {
+      request("charlie", ["src/auth"], {
         nowMs: 1_800_000_003_000,
       }),
     );
-    expect(next.status).toBe("granted");
+    expect(next.peers.map((peer) => peer.agent_id)).toEqual(["bravo"]);
 
     const database = new Database(dbPath, { readonly: true });
     const active = database
@@ -658,280 +528,54 @@ describe("AgentFrequencyStore.announce", () => {
     });
   });
 
-  test("testing keeps the lease but hands the claimed paths back to peers", () => {
+  test("reads exclusive claims from older processes as plain paths that never block", () => {
     const { store, dbPath } = createStoreWithPath();
-    const first = store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    const blocked = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-    expect(blocked.status).toBe("blocked");
+    const legacy = store.announce(request("legacy", ["src/auth"]));
+    // An MCP process started before this version still writes exclusive
+    // claims and the retired planning flag into the shared database.
+    const database = new Database(dbPath, { strict: true });
+    database
+      .query("UPDATE claims SET access = 'exclusive' WHERE lease_id = ?")
+      .run(legacy.self.lease_id!);
+    database.query("UPDATE leases SET planning = 1 WHERE lease_id = ?").run(legacy.self.lease_id!);
+    database.close(false);
 
-    const testing = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
-        state: "testing",
-        summary: "Running the auth suite",
-        leaseId: first.self.lease_id!,
-        nowMs: 1_800_000_002_000,
-      }),
-    );
+    const result = store.announce(request("bravo", ["src/auth/token.ts"]));
+    expect(result.status).toBe("active");
+    expect(result.self.paths).toEqual(["src/auth/token.ts"]);
+    expect(result.peers).toMatchObject([{ agent_id: "legacy", paths: ["src/auth"] }]);
+    expect(result.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeTrue();
+  });
 
-    expect(testing.status).toBe("granted");
-    expect(testing.self).toMatchObject({
-      lease_id: first.self.lease_id,
-      renewed: true,
-      active: true,
-      state: "testing",
-      // Exclusive is downgraded rather than rejected, so an agent can hand the
-      // same scope list back with one changed field.
-      granted_scopes: [{ path: "src/auth", access: "shared" }],
-      blocked_scopes: [],
-    });
-
-    const retry = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
-        nowMs: 1_800_000_003_000,
-      }),
+  test("writes leases that older processes read as advisory, on announce and on renewal", () => {
+    // Processes started before awareness-only leases block whenever either
+    // side of an overlap is exclusive, unless the peer lease is testing with
+    // shared paths only. Every lease this version writes must look like that.
+    const { store, dbPath } = createStoreWithPath();
+    const first = store.announce(request("alpha", ["src/auth", "docs"]));
+    store.announce(
+      request("alpha", ["src"], { leaseId: first.self.lease_id!, nowMs: 1_800_000_001_000 }),
     );
-    expect(retry.status).toBe("granted");
-    expect(retry.warnings.find((warning) => warning.code === "TESTING_SCOPE_OVERLAP")?.message)
-      .toBe(
-        "Agents are testing overlapping paths, so your edits can invalidate their run: src/auth/token.ts with alpha:src/auth",
-      );
-    expect(retry.peers.find((peer) => peer.agent_id === "alpha")).toMatchObject({
-      state: "testing",
-      scopes: [{ path: "src/auth", access: "shared" }],
-    });
+    store.announce(request("bravo", ["tests"]));
 
     const database = new Database(dbPath, { readonly: true });
-    const event = database
-      .query(
-        `SELECT agent_state, testing FROM activity_events
-         WHERE agent_id = 'alpha' ORDER BY event_id DESC LIMIT 1`,
-      )
-      .get() as Record<string, unknown>;
+    const leases = database
+      .query("SELECT agent_id, agent_state, testing FROM leases ORDER BY agent_id")
+      .all();
+    const accesses = database.query("SELECT DISTINCT access FROM claims").all();
     database.close(false);
-    // Storage keeps the v2 agent_state values and carries testing additively.
-    expect(event).toEqual({ agent_state: "working", testing: 1 });
-  });
-
-  test("planning advertises paths without claiming them, and is capped to 5m", () => {
-    const { store, dbPath } = createStoreWithPath();
-    const planning = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
-        state: "planning",
-        summary: "Working out how token refresh should change",
-        timebox: "2h",
-      }),
-    );
-
-    expect(planning.status).toBe("granted");
-    expect(planning.self).toMatchObject({
-      state: "planning",
-      // Exclusive is downgraded rather than rejected, like testing.
-      granted_scopes: [{ path: "src/auth", access: "shared" }],
-      blocked_scopes: [],
-      // The echoed timebox is the effective one, not the requested one.
-      timebox: "5m",
-    });
-    expect(planning.self.expires_at).toBe(new Date(1_800_000_000_000 + 5 * 60_000).toISOString());
-    expect(planning.message).toContain("Re-announce as working before you edit");
-
-    // An editor arriving next takes its exclusive claim with no interference.
-    const editor = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-    expect(editor.status).toBe("granted");
-    expect(editor.self.blocked_scopes).toEqual([]);
-    expect(editor.peers.find((peer) => peer.agent_id === "alpha")).toMatchObject({
-      state: "planning",
-      scopes: [{ path: "src/auth", access: "shared" }],
-    });
-
-    const database = new Database(dbPath, { readonly: true });
-    const event = database
-      .query(
-        `SELECT agent_state, testing, planning FROM activity_events
-         WHERE agent_id = 'alpha' ORDER BY event_id DESC LIMIT 1`,
-      )
-      .get() as Record<string, unknown>;
-    database.close(false);
-    // Storage keeps the v2 agent_state values and carries planning additively.
-    expect(event).toEqual({ agent_state: "working", testing: 0, planning: 1 });
-  });
-
-  test("a planner is neither blocked by nor a warning to the agents around it", () => {
-    const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    store.announce(
-      request("tester", [{ path: "src/billing", access: "shared" }], {
-        state: "testing",
-        nowMs: 1_800_000_000_500,
-      }),
-    );
-
-    // Reading exactly where alpha holds an exclusive claim and where tester is
-    // verifying: a planner edits nothing, so neither is its problem.
-    const planner = store.announce(
-      request(
-        "scout",
-        [
-          { path: "src/auth", access: "exclusive" },
-          { path: "src/billing", access: "shared" },
-        ],
-        { state: "planning", nowMs: 1_800_000_001_000 },
-      ),
-    );
-    expect(planner.status).toBe("granted");
-    expect(planner.self.blocked_scopes).toEqual([]);
-    expect(planner.warnings.map((warning) => warning.code)).not.toContain("SHARED_SCOPE_OVERLAP");
-    expect(planner.warnings.map((warning) => warning.code)).not.toContain("TESTING_SCOPE_OVERLAP");
-    // Presence warnings still reach the planner: that traffic is the reason to
-    // announce this early at all.
-    expect(planner.warnings.map((warning) => warning.code)).toContain("SAME_WORKTREE");
-
-    // ...and in the other direction the planner raises nothing at all.
-    const editor = store.announce(
-      request("bravo", [{ path: "src/reports", access: "exclusive" }], {
-        nowMs: 1_800_000_002_000,
-        metadata: metadata({ worktreeId: "worktree-2", worktreeRoot: "/code/example-bravo" }),
-      }),
-    );
-    expect(editor.status).toBe("granted");
-    expect(editor.warnings.find((warning) => warning.code === "SAME_BRANCH")?.message)
-      .toBe("Agents on branch main: alpha, tester");
-    expect(editor.peers.map((peer) => peer.agent_id)).toContain("scout");
-  });
-
-  test("planning peers sort last so they cannot bury an actionable one", () => {
-    const store = createStore();
-    for (let index = 0; index < 3; index += 1) {
-      store.announce(
-        request(`planner-${index}`, [{ path: "src/auth", access: "shared" }], {
-          state: "planning",
-          nowMs: 1_800_000_001_000 + index,
-        }),
-      );
-    }
-    store.announce(
-      request("blocker", [{ path: "src/auth", access: "exclusive" }], {
-        nowMs: 1_800_000_000_000,
-      }),
-    );
-
-    const caller = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
-        nowMs: 1_800_000_002_000,
-      }),
-    );
-    expect(caller.status).toBe("blocked");
-    // Every planner is newer, and each advertises the requested path; ranking
-    // still puts the one agent this caller has to coordinate with first.
-    expect(caller.peers[0]?.agent_id).toBe("blocker");
-  });
-
-  test("an exclusive claim still blocks when a stale planning flag survives a renewal", () => {
-    const { store, dbPath } = createStoreWithPath();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    // An MCP process built before this state renews a lease without knowing the
-    // flag column exists: real exclusive claims, stale planning = 1.
-    const database = new Database(dbPath, { strict: true });
-    database.exec("UPDATE leases SET planning = 1 WHERE agent_id = 'alpha'");
-    database.close(false);
-
-    const peer = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-
-    expect(peer.status).toBe("blocked");
-    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
-  });
-
-  test("announcing working after planning takes the exclusive claim for real", () => {
-    const store = createStore();
-    const plan = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], { state: "planning" }),
-    );
-
-    const editing = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
-        summary: "Rewriting token refresh",
-        leaseId: plan.self.lease_id!,
-        timebox: "1h",
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-    expect(editing.self.granted_scopes).toEqual([{ path: "src/auth", access: "exclusive" }]);
-    // The planning cap lifts with the state that imposed it.
-    expect(editing.self.timebox).toBe("1h");
-
-    const peer = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
-        nowMs: 1_800_000_002_000,
-      }),
-    );
-    expect(peer.status).toBe("blocked");
-    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
-  });
-
-  test("an exclusive claim still blocks when a stale testing flag survives a renewal", () => {
-    const { store, dbPath } = createStoreWithPath();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    // An MCP process built before this state renews a lease without knowing the
-    // flag column exists: real exclusive claims, stale testing = 1.
-    const database = new Database(dbPath, { strict: true });
-    database.exec("UPDATE leases SET testing = 1 WHERE agent_id = 'alpha'");
-    database.close(false);
-
-    const peer = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-
-    expect(peer.status).toBe("blocked");
-    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
-  });
-
-  test("announcing working again after testing re-takes the exclusive claim", () => {
-    const store = createStore();
-    const first = store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
-        state: "testing",
-        leaseId: first.self.lease_id!,
-        nowMs: 1_800_000_001_000,
-      }),
-    );
-
-    const fixing = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
-        summary: "Fixing a failing auth test",
-        leaseId: first.self.lease_id!,
-        nowMs: 1_800_000_002_000,
-      }),
-    );
-    expect(fixing.self.granted_scopes).toEqual([{ path: "src/auth", access: "exclusive" }]);
-
-    const peer = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "shared" }], {
-        nowMs: 1_800_000_003_000,
-      }),
-    );
-    expect(peer.status).toBe("blocked");
-    expect(peer.peers.find((entry) => entry.agent_id === "alpha")?.state).toBe("working");
+    expect(leases).toEqual([
+      { agent_id: "alpha", agent_state: "working", testing: 1 },
+      { agent_id: "bravo", agent_state: "working", testing: 1 },
+    ]);
+    expect(accesses).toEqual([{ access: "shared" }]);
   });
 
   test("keeps the same agent's leases in other worktrees when it announces fresh", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    store.announce(request("alpha", ["src/auth"]));
     store.announce(
-      request("alpha", [{ path: "docs", access: "shared" }], {
+      request("alpha", ["docs"], {
         metadata: metadata({ worktreeId: "worktree-2", worktreeRoot: "/code/example-two" }),
       }),
     );
@@ -939,10 +583,12 @@ describe("AgentFrequencyStore.announce", () => {
     const observer = store.announce(request("bravo", []));
     expect(observer.peers.filter((peer) => peer.agent_id === "alpha")).toHaveLength(2);
 
-    const blocked = store.announce(
-      request("charlie", [{ path: "src/auth/token.ts", access: "shared" }]),
+    const overlapping = store.announce(
+      request("charlie", ["src/auth/token.ts"]),
     );
-    expect(blocked.status).toBe("blocked");
+    expect(overlapping.warnings.find((warning) => warning.code === "PATH_OVERLAP")?.message).toBe(
+      "Agents in this worktree are editing overlapping paths: src/auth/token.ts with alpha:src/auth",
+    );
   });
 
   test("shares dirty paths with peers, bounded to the storage cap", () => {
@@ -961,18 +607,18 @@ describe("AgentFrequencyStore.announce", () => {
     expect(alpha?.dirty_paths.slice(0, 2)).toEqual(["src/file-0.ts", "src/file-1.ts"]);
   });
 
-  test("records granted, blocked, and renewed announcements without lease handles", () => {
+  test("records announcements and renewals without lease handles, never as blocked", () => {
     const { store, dbPath } = createStoreWithPath();
     const first = store.announce(
-      request("alpha", [{ path: "src", access: "exclusive" }]),
+      request("alpha", ["src"]),
     );
     store.announce(
-      request("bravo", [{ path: "src/file.ts", access: "shared" }], {
+      request("bravo", ["src/file.ts"], {
         nowMs: 1_800_000_001_000,
       }),
     );
     store.announce(
-      request("alpha", [{ path: "docs", access: "shared" }], {
+      request("alpha", ["docs"], {
         leaseId: first.self.lease_id!,
         nowMs: 1_800_000_002_000,
       }),
@@ -1001,12 +647,12 @@ describe("AgentFrequencyStore.announce", () => {
       },
       {
         event_type: "announced",
-        status: "blocked",
+        status: "granted",
         agent_id: "bravo",
         client_surface: "cli",
         requested_scope_count: 1,
-        granted_scope_count: 0,
-        blocked_scope_count: 1,
+        granted_scope_count: 1,
+        blocked_scope_count: 0,
       },
       {
         event_type: "renewed",
@@ -1074,10 +720,10 @@ describe("AgentFrequencyStore.announce", () => {
 describe("AgentFrequencyStore task emoji", () => {
   test("returns the announced emoji to the caller and to peers", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src/auth", access: "shared" }], { emoji: "🐛" }));
+    store.announce(request("alpha", ["src/auth"], { emoji: "🐛" }));
 
     const result = store.announce(
-      request("beta", [{ path: "src/billing", access: "shared" }], { emoji: "🧾" }),
+      request("beta", ["src/billing"], { emoji: "🧾" }),
     );
 
     expect(result.self.emoji).toBe("🧾");
@@ -1127,7 +773,7 @@ describe("AgentFrequencyStore schema versioning", () => {
     const dbPath = join(directory, "state.sqlite3");
 
     const original = new AgentFrequencyStore({ dbPath });
-    original.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    original.announce(request("alpha", ["src/auth"]));
     original.close();
     const oldV2 = new Database(dbPath, { strict: true });
     oldV2.exec("ALTER TABLE leases DROP COLUMN emoji");
@@ -1149,7 +795,7 @@ describe("AgentFrequencyStore schema versioning", () => {
     const dbPath = join(directory, "state.sqlite3");
 
     const original = new AgentFrequencyStore({ dbPath });
-    const alpha = original.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
+    const alpha = original.announce(request("alpha", ["src/auth"]));
     original.announce(
       request("alpha", [], {
         state: "stopped",
@@ -1227,7 +873,7 @@ describe("AgentFrequencyStore schema versioning", () => {
 
     const store = new AgentFrequencyStore({ dbPath });
     stores.push(store);
-    expect(store.announce(request("alpha", [])).status).toBe("granted");
+    expect(store.announce(request("alpha", [])).status).toBe("active");
   });
 
   test("refuses state owned by a newer schema", () => {
@@ -1244,15 +890,15 @@ describe("AgentFrequencyStore schema versioning", () => {
 });
 
 describe("stopped announcements", () => {
-  test("stopped releases the lease and claims exactly like done", () => {
+  test("stopped releases the lease exactly like done", () => {
     const { store, dbPath } = createStoreWithPath();
-    const alpha = store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    const blocked = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+    const alpha = store.announce(request("alpha", ["src/auth"]));
+    const overlapping = store.announce(
+      request("bravo", ["src/auth/token.ts"], {
         nowMs: 1_800_000_001_000,
       }),
     );
-    expect(blocked.status).toBe("blocked");
+    expect(overlapping.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeTrue();
 
     const stop = store.announce(
       request("alpha", [], {
@@ -1265,15 +911,17 @@ describe("stopped announcements", () => {
       }),
     );
     expect(stop.status).toBe("stopped");
-    expect(stop.self).toMatchObject({ lease_id: null, active: false, state: "stopped" });
+    expect(stop.self).toMatchObject({ lease_id: null, state: "stopped" });
     expect(stop.message).toContain("Stop announced");
 
-    const retry = store.announce(
-      request("bravo", [{ path: "src/auth/token.ts", access: "exclusive" }], {
+    const after = store.announce(
+      request("bravo", ["src/auth/token.ts"], {
+        leaseId: overlapping.self.lease_id!,
         nowMs: 1_800_000_003_000,
       }),
     );
-    expect(retry.status).toBe("granted");
+    expect(after.peers).toEqual([]);
+    expect(after.warnings.some((warning) => warning.code === "PATH_OVERLAP")).toBeFalse();
 
     // Storage keeps the v2 agent_state values and carries the stop additively,
     // beside the reason the caller gave.
@@ -1327,46 +975,6 @@ describe("stopped announcements", () => {
       { agent_id: "bravo", stopped: 1, waiting_on: null },
     ]);
   });
-
-  test("a blocked call records who was blocking, bounded and deduplicated", () => {
-    const { store, dbPath } = createStoreWithPath();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-    const blocked = store.announce(
-      request(
-        "bravo",
-        [
-          { path: "src/auth/token.ts", access: "exclusive" },
-          { path: "src/auth/session.ts", access: "exclusive" },
-        ],
-        { nowMs: 1_800_000_001_000 },
-      ),
-    );
-    expect(blocked.status).toBe("blocked");
-
-    const database = new Database(dbPath, { readonly: true });
-    const event = database
-      .query(
-        `SELECT status, blockers FROM activity_events
-         WHERE agent_id = 'bravo' ORDER BY event_id DESC LIMIT 1`,
-      )
-      .get() as { status: string; blockers: string };
-    database.close(false);
-    expect(event.status).toBe("blocked");
-    // Both blocked scopes hit the same claim, so the record keeps one entry.
-    expect(JSON.parse(event.blockers)).toEqual([{ agent_id: "alpha", path: "src/auth" }]);
-  });
-
-  test("a granted call records no blockers", () => {
-    const { store, dbPath } = createStoreWithPath();
-    store.announce(request("alpha", [{ path: "src/auth", access: "exclusive" }]));
-
-    const database = new Database(dbPath, { readonly: true });
-    const event = database
-      .query("SELECT blockers FROM activity_events ORDER BY event_id DESC LIMIT 1")
-      .get() as { blockers: string };
-    database.close(false);
-    expect(JSON.parse(event.blockers)).toEqual([]);
-  });
 });
 
 describe("recent peers", () => {
@@ -1377,7 +985,7 @@ describe("recent peers", () => {
   test("a fresh lease hears agents that recently completed", () => {
     const store = createStore();
     const alpha = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], {
+      request("alpha", ["src/auth"], {
         nowMs: T,
         emoji: "🔧",
       }),
@@ -1406,7 +1014,7 @@ describe("recent peers", () => {
   test("an agent that stopped unfinished is reported as stopped, with its reason", () => {
     const store = createStore();
     const alpha = store.announce(
-      request("alpha", [{ path: "src/auth", access: "exclusive" }], { nowMs: T }),
+      request("alpha", ["src/auth"], { nowMs: T }),
     );
     store.announce(
       request("alpha", [], {
@@ -1451,11 +1059,11 @@ describe("recent peers", () => {
 
   test("an agent whose lease lapsed without done is reported as expired", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src", access: "shared" }], { nowMs: T }));
+    store.announce(request("alpha", ["src"], { nowMs: T }));
 
-    // 15m timebox: at T+16m the lease is lazily deleted, but the last event
-    // on record is still a working announcement.
-    const observer = store.announce(request("beta", [], { nowMs: T + 16 * MINUTE }));
+    // 30m lease: at T+31m the lease is lazily deleted, but the last event on
+    // record is still a working announcement.
+    const observer = store.announce(request("beta", [], { nowMs: T + 31 * MINUTE }));
     expect(observer.peers).toHaveLength(0);
     expect(observer.recent_peers).toHaveLength(1);
     expect(observer.recent_peers[0]).toMatchObject({
@@ -1467,7 +1075,7 @@ describe("recent peers", () => {
 
   test("active agents appear as peers, never as recent peers", () => {
     const store = createStore();
-    store.announce(request("alpha", [{ path: "src", access: "shared" }], { nowMs: T }));
+    store.announce(request("alpha", ["src"], { nowMs: T }));
 
     const observer = store.announce(request("beta", [], { nowMs: T + MINUTE }));
     expect(observer.peers.map((peer) => peer.agent_id)).toEqual(["alpha"]);
@@ -1477,10 +1085,10 @@ describe("recent peers", () => {
   test("one entry per agent, from its latest event", () => {
     const store = createStore();
     const alpha = store.announce(
-      request("alpha", [{ path: "src", access: "shared" }], { nowMs: T }),
+      request("alpha", ["src"], { nowMs: T }),
     );
     store.announce(
-      request("alpha", [{ path: "src", access: "shared" }], {
+      request("alpha", ["src"], {
         leaseId: alpha.self.lease_id ?? undefined,
         summary: "alpha renewing",
         nowMs: T + MINUTE,
@@ -1558,39 +1166,6 @@ describe("recent peers", () => {
     );
     expect(completion.status).toBe("completed");
     expect(completion.recent_peers).toHaveLength(0);
-  });
-
-  test("an agent that only ever planned leaves no trace in recent peers", () => {
-    const store = createStore();
-    // Its lease lapses without a word, which for an editor would report
-    // "expired" — the signal that says changes here may be half-done.
-    store.announce(request("scout", [], { state: "planning", nowMs: T }));
-
-    const observer = store.announce(request("beta", [], { nowMs: T + 30 * MINUTE }));
-    expect(observer.recent_peers).toHaveLength(0);
-  });
-
-  test("planning first does not hide an agent that went on to edit", () => {
-    const store = createStore();
-    const plan = store.announce(request("scout", [], { state: "planning", nowMs: T }));
-    store.announce(
-      request("scout", [{ path: "src/auth", access: "exclusive" }], {
-        leaseId: plan.self.lease_id ?? undefined,
-        nowMs: T + MINUTE,
-      }),
-    );
-    // Back to planning after a chunk of work, then gone: the edits are still
-    // out there, so this agent still owes the next one an explanation.
-    store.announce(
-      request("scout", [], {
-        state: "planning",
-        leaseId: plan.self.lease_id ?? undefined,
-        nowMs: T + 2 * MINUTE,
-      }),
-    );
-
-    const observer = store.announce(request("beta", [], { nowMs: T + 30 * MINUTE }));
-    expect(observer.recent_peers).toMatchObject([{ agent_id: "scout", outcome: "expired" }]);
   });
 
   test("the orientation window is bounded and the list capped, newest first", () => {

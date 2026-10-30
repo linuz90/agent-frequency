@@ -29,7 +29,8 @@ const VIEWPORT = { width: 1400, height: 1050, scale: 2 };
 const SHOTS = [
   { file: "docs/monitor.png", path: "/" },
   // The filtered view is the only framing where one 4:3 frame holds the whole
-  // collision story: a shared worktree, a partial block, and a full block.
+  // shared-checkout story: several agents in one worktree, two of them
+  // editing overlapping paths, and a parallel worktree beside them.
   { file: "docs/monitor-worktrees.png", path: "/?repo=acme-web" },
 ];
 
