@@ -1,7 +1,7 @@
 import { sanitizeEmoji } from "./emoji";
 import { collectGitMetadata } from "./git";
 import { AgentFrequencyStore } from "./store";
-import { DEFAULT_TIMEBOX, normalizeWaitingOn } from "./types";
+import { normalizeWaitingOn } from "./types";
 import type { ClientSurface } from "./client-surface";
 import type { AnnounceInput, AnnounceOutput, WaitingOn } from "./types";
 
@@ -74,12 +74,11 @@ export async function coordinateAnnouncement(
       summary: sanitizeSummary(input.summary),
       reason: sanitizeReason(input.reason, input.state ?? "working"),
       waitingOn: sanitizeWaitingOn(input.waiting_on, input.state ?? "working"),
-      // An unusable emoji is decoration, not coordination data: drop it and let
-      // the announcement through rather than failing a safety-relevant call.
+      // An unusable emoji is decoration: drop it and let the announcement
+      // through rather than failing the whole call.
       emoji: sanitizeEmoji(input.emoji),
       metadata,
-      scopes: input.scopes ?? [],
-      timebox: input.timebox ?? DEFAULT_TIMEBOX,
+      paths: input.paths ?? [],
       leaseId: input.lease_id,
       nowMs: options.nowMs,
     });

@@ -56,8 +56,7 @@ function realRequest(overrides: Partial<StoreAnnounceRequest> = {}): StoreAnnoun
       dirtyPaths: [],
       metadataComplete: true,
     },
-    scopes: [{ path: "src/billing", access: "exclusive" }],
-    timebox: "1h",
+    paths: ["src/billing"],
     nowMs: NOW_MS,
     ...overrides,
   };
@@ -102,15 +101,13 @@ describe("demo traffic", () => {
     }
   });
 
-  test("never blocks or warns a real agent, because demo projects are unrelated", () => {
+  test("never warns a real agent, because demo projects are unrelated", () => {
     const { store } = createStore();
     seedDemoTraffic(store, { nowMs: NOW_MS, home: HOME });
 
     const result = store.announce(realRequest({ trafficScope: "machine" }));
 
-    expect(result.status).toBe("granted");
-    expect(result.self.blocked_scopes).toEqual([]);
-    expect(result.warnings.map((warning) => warning.code)).not.toContain("SAME_BRANCH");
+    expect(result.warnings).toEqual([]);
     expect(result.peers.length).toBeGreaterThan(0);
     expect(result.peers.every((peer) => peer.relation === "other_project")).toBe(true);
   });
@@ -132,8 +129,8 @@ describe("demo traffic", () => {
 
     const database = new Database(dbPath, { readonly: true });
     try {
-      const claims = database.query("SELECT lease_id FROM claims").all() as Array<{ lease_id: string }>;
-      expect(claims.every((claim) => claim.lease_id === remaining[0]?.lease_id)).toBe(true);
+      const paths = database.query("SELECT lease_id FROM claims").all() as Array<{ lease_id: string }>;
+      expect(paths.every((path) => path.lease_id === remaining[0]?.lease_id)).toBe(true);
       const events = database.query("SELECT agent_id FROM activity_events").all() as Array<{
         agent_id: string;
       }>;

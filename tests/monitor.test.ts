@@ -57,6 +57,8 @@ interface BrowserIdentityEntry {
     agent_id: string;
     agent_label: string;
     client_surface: string;
+    worktree_root?: string;
+    paths?: string[];
   };
   machine: string | null;
 }
@@ -65,6 +67,11 @@ interface BrowserIdentityInternals {
   groupEntriesByIdentity(entries: BrowserIdentityEntry[]): Array<{
     entries: BrowserIdentityEntry[];
   }>;
+  overlapsFor(
+    entry: BrowserIdentityEntry,
+    entries: BrowserIdentityEntry[],
+  ): Array<{ agent_id: string; path: string }>;
+  normalizeState<T>(state: T): T;
 }
 
 /** Executes the shipped browser bundle far enough to expose its pure grouping
@@ -77,7 +84,9 @@ function browserIdentityInternals(): BrowserIdentityInternals {
   const instrumented = source.replace(
     marker,
     `  globalThis.__agentFrequencyIdentityTest = {
-    groupEntriesByIdentity: groupEntriesByIdentity
+    groupEntriesByIdentity: groupEntriesByIdentity,
+    overlapsFor: overlapsFor,
+    normalizeState: normalizeState
   };
 ${marker}`,
   );
@@ -357,6 +366,63 @@ describe("monitor", () => {
     ]);
   });
 
+  test("finds overlapping paths only among other agents in the same checkout", () => {
+    const { overlapsFor } = browserIdentityInternals();
+    const inCheckout = (agentId: string, paths: string[], overrides = {}) =>
+      browserIdentityEntry(agentId, {
+        lease: { worktree_root: "/code/app", paths },
+        ...overrides,
+      });
+    const alpha = inCheckout("Claude AAAA", ["src/billing"]);
+    const entries = [
+      alpha,
+      inCheckout("Codex BBBB", ["src/billing/invoice.ts", "src/billing/pdf.ts"]),
+      inCheckout("Claude CCCC", ["docs"]),
+      inCheckout("Claude DDDD", ["src/billing"], { machine: "mba" }),
+      browserIdentityEntry("Claude EEEE", {
+        lease: { worktree_root: "/code/app-worktree", paths: ["src/billing"] },
+      }),
+    ];
+
+    // The page rebuilds entry objects on every call, so the card's own lease
+    // arrives as a separate copy and must still never overlap with itself.
+    const ownCopy = inCheckout("Claude AAAA", ["src/billing"]);
+    expect(overlapsFor(ownCopy, entries)).toEqual([
+      { agent_id: "Codex BBBB", path: "src/billing/invoice.ts" },
+      { agent_id: "Codex BBBB", path: "src/billing/pdf.ts" },
+    ]);
+    expect(overlapsFor(inCheckout("Claude CCCC", ["docs"]), entries)).toEqual([]);
+    // Most macOS checkouts ignore case, so the page does too.
+    expect(overlapsFor(inCheckout("Claude FFFF", ["SRC/Billing/PDF.ts"]), entries)).toEqual([
+      { agent_id: "Claude AAAA", path: "src/billing" },
+      { agent_id: "Codex BBBB", path: "src/billing/pdf.ts" },
+    ]);
+  });
+
+  test("renders a claim-era payload from a monitor process that has not restarted", () => {
+    const { normalizeState } = browserIdentityInternals();
+    const legacyLease = () => ({
+      agent_id: "Claude OLD1",
+      agent_state: "testing",
+      claims: [{ path: "src/Auth.ts", access: "exclusive" }],
+    });
+    const state = normalizeState({
+      leases: [legacyLease()],
+      events: [
+        { agent_state: "planning", requested_scope_count: 2, status: "blocked" },
+        { agent_state: "stopped", path_count: 1 },
+      ],
+      peers: [{ snapshot: { leases: [legacyLease()], events: [] } }, { snapshot: null }],
+    });
+
+    expect(state.leases[0]).toMatchObject({ agent_state: "working", paths: ["src/Auth.ts"] });
+    expect(state.peers[0]?.snapshot?.leases[0]).toMatchObject({ paths: ["src/Auth.ts"] });
+    expect(state.events).toMatchObject([
+      { agent_state: "working", path_count: 2 },
+      { agent_state: "stopped", path_count: 1 },
+    ]);
+  });
+
   test("serves a valid empty payload when the database does not exist yet", async () => {
     const monitor = startTestMonitor(temporaryDatabasePath());
     const state = await fetchState(monitor);
@@ -403,7 +469,7 @@ describe("monitor", () => {
     }
   });
 
-  test("returns active leases with parsed dirty paths and joined claims", async () => {
+  test("returns active leases with parsed dirty paths and joined paths", async () => {
     const dbPath = temporaryDatabasePath();
     seedDatabase(dbPath, Date.now());
     const monitor = startTestMonitor(dbPath);
@@ -425,28 +491,23 @@ describe("monitor", () => {
     expect(lease?.dirty).toBeTrue();
     expect(lease?.dirty_count).toBe(2);
     expect(lease?.dirty_paths).toEqual(["src/auth/token.ts", "tests/auth/token.test.ts"]);
-    // Exclusive claims sort first so the strongest signal leads each card.
-    expect(lease?.claims).toEqual([
-      { path: "src/auth/token.ts", access: "exclusive" },
-      { path: "tests/auth", access: "shared" },
-    ]);
+    // Rows an older process wrote with an access mode read back as plain paths.
+    expect(lease?.paths).toEqual(["src/auth/token.ts", "tests/auth"]);
     // The renewal handle stays server-side even on a local read-only surface.
     expect(JSON.stringify(state)).not.toContain("lease-active");
 
     expect(state.event_count).toBe(3);
     expect(state.events_truncated).toBe(0);
-    expect(state.events.map((event) => [event.event_type, event.status, event.agent_id])).toEqual([
-      ["announced", "granted", "charlie"],
-      ["announced", "granted", "alpha"],
-      ["renewed", "blocked", "bravo"],
+    expect(state.events.map((event) => [event.event_type, event.agent_id])).toEqual([
+      ["announced", "charlie"],
+      ["announced", "alpha"],
+      ["renewed", "bravo"],
     ]);
     expect(state.events[0]).toMatchObject({
       agent_state: "done",
       summary: "Finished lifecycle support",
       client_surface: "codex-app",
-      requested_scope_count: 0,
-      granted_scope_count: 0,
-      blocked_scope_count: 0,
+      path_count: 0,
       peer_count: 2,
     });
     expect(state.events[1]).toMatchObject({
@@ -454,11 +515,12 @@ describe("monitor", () => {
       summary: "Refactor token refresh handling",
       client_surface: "t3-code",
       repo_name: "example",
-      requested_scope_count: 2,
-      granted_scope_count: 2,
-      blocked_scope_count: 0,
+      path_count: 2,
       peer_count: 1,
     });
+    // The claim-era status and blockers no longer reach the page.
+    expect(state.events[2]).not.toHaveProperty("status");
+    expect(state.events[2]).not.toHaveProperty("blockers");
   });
 
   test("never writes to the database it reads", async () => {
@@ -544,83 +606,39 @@ describe("monitor", () => {
     expect(state.events.every((event) => event.emoji === null)).toBeTrue();
   });
 
-  test("reports the additive testing flag as a testing agent state", async () => {
+  test("reads the retired testing and planning flags as a working agent", async () => {
     const dbPath = temporaryDatabasePath();
     seedDatabase(dbPath, Date.now());
     const database = new Database(dbPath, { strict: true });
-    // Matches the store's additive upgrade: the v2 agent_state column stays as
-    // it is and "testing" arrives as a flag alongside it.
+    // An MCP process started before awareness-only leases still writes these
+    // flags into the shared database until it exits.
     database.exec("ALTER TABLE leases ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
-    database.exec("ALTER TABLE activity_events ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE leases SET testing = 1 WHERE agent_id = 'alpha'");
-    database.exec("UPDATE activity_events SET testing = 1 WHERE agent_id = 'alpha'");
-    // Testing releases every exclusive claim, so a real testing lease holds
-    // shared paths only.
-    database.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
-    database.close(false);
-    const monitor = startTestMonitor(dbPath);
-
-    const state = await fetchState(monitor);
-    expect(state.leases[0]?.agent_state).toBe("testing");
-    expect(state.events.map((event) => event.agent_state)).toEqual(["done", "testing", "working"]);
-
-    // An older process renewing that lease writes real claims without touching
-    // the flag, and the claims are what count.
-    const stale = new Database(dbPath, { strict: true });
-    stale.exec(
-      "UPDATE claims SET access = 'exclusive' WHERE lease_id = 'lease-active' AND path = 'src/auth/token.ts'",
-    );
-    stale.close(false);
-    expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
-  });
-
-  test("reports the additive planning flag as a planning agent state", async () => {
-    const dbPath = temporaryDatabasePath();
-    seedDatabase(dbPath, Date.now());
-    const database = new Database(dbPath, { strict: true });
-    // Same additive upgrade as testing: v2 agent_state is untouched and
-    // "planning" arrives beside it.
     database.exec("ALTER TABLE leases ADD COLUMN planning INTEGER NOT NULL DEFAULT 0");
+    database.exec("ALTER TABLE activity_events ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
     database.exec("ALTER TABLE activity_events ADD COLUMN planning INTEGER NOT NULL DEFAULT 0");
-    database.exec("UPDATE leases SET planning = 1 WHERE agent_id = 'alpha'");
+    database.exec("UPDATE leases SET testing = 1, planning = 1 WHERE agent_id = 'alpha'");
     database.exec("UPDATE activity_events SET planning = 1 WHERE agent_id = 'alpha'");
-    // A planner claims nothing, so its advertised paths are shared.
-    database.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
+    database.exec("UPDATE activity_events SET testing = 1 WHERE agent_id = 'bravo'");
     database.close(false);
     const monitor = startTestMonitor(dbPath);
 
     const state = await fetchState(monitor);
-    expect(state.leases[0]?.agent_state).toBe("planning");
-    expect(state.events.map((event) => event.agent_state)).toEqual(["done", "planning", "working"]);
-
-    // As with testing, an older process renewing that lease writes real claims
-    // without touching the flag, and the claims are what count.
-    const stale = new Database(dbPath, { strict: true });
-    stale.exec(
-      "UPDATE claims SET access = 'exclusive' WHERE lease_id = 'lease-active' AND path = 'src/auth/token.ts'",
-    );
-    stale.close(false);
-    expect((await fetchState(monitor)).leases[0]?.agent_state).toBe("working");
+    expect(state.leases[0]?.agent_state).toBe("working");
+    expect(state.events.map((event) => event.agent_state)).toEqual(["done", "working", "working"]);
   });
 
-  test("reports the additive stopped flag with its reason, and recorded blockers", async () => {
+  test("reports the additive stopped flag with its reason", async () => {
     const dbPath = temporaryDatabasePath();
     seedDatabase(dbPath, Date.now());
     const database = new Database(dbPath, { strict: true });
     // Matches the store's additive upgrade: a stop is agent_state 'done' plus
-    // the stopped flag and a reason; blocked calls carry blocker identity.
+    // the stopped flag and a reason.
     database.exec("ALTER TABLE activity_events ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0");
     database.exec("ALTER TABLE activity_events ADD COLUMN reason TEXT");
-    database.exec("ALTER TABLE activity_events ADD COLUMN blockers TEXT NOT NULL DEFAULT '[]'");
     database.exec(
       `UPDATE activity_events
        SET agent_state = 'done', stopped = 1, reason = 'waiting on user input'
        WHERE agent_id = 'charlie'`,
-    );
-    database.exec(
-      `UPDATE activity_events
-       SET blockers = '[{"agent_id":"Codex A001","path":"src/auth"}]'
-       WHERE agent_id = 'bravo'`,
     );
     database.close(false);
     const monitor = startTestMonitor(dbPath);
@@ -629,14 +647,11 @@ describe("monitor", () => {
     const stopped = state.events.find((event) => event.agent_id === "charlie");
     expect(stopped?.agent_state).toBe("stopped");
     expect(stopped?.reason).toBe("waiting on user input");
-    const blocked = state.events.find((event) => event.agent_id === "bravo");
-    expect(blocked?.blockers).toEqual([{ agent_id: "Codex A001", path: "src/auth" }]);
-    // Rows and databases that predate the columns degrade to no stop and no
-    // blockers, never a hidden event.
+    // Rows and databases that predate the columns degrade to no stop, never a
+    // hidden event.
     const plain = state.events.find((event) => event.agent_id === "alpha");
     expect(plain?.agent_state).toBe("working");
     expect(plain?.reason).toBeNull();
-    expect(plain?.blockers).toEqual([]);
     // A database whose stops predate waiting_on reports it as unsaid.
     expect(stopped?.waiting_on).toBeNull();
   });
@@ -748,6 +763,7 @@ describe("monitor", () => {
     // than left for the reader to compute, and it is recomputed on the clock.
     expect(html).toContain("function staleAfterMs(lease)");
     expect(html).toContain("if (!lease.timebox_seconds) return UNKNOWN_TIMEBOX_STALE_MS");
+    expect(html).toContain("half this lease's window");
     expect(html).toContain("return (lease.timebox_seconds * 1000) / 2");
     expect(html).toContain('trackTime(updated, "age", lease.updated_at_ms, staleAfterMs(lease))');
     expect(html).toContain('entry.node.classList.toggle("stale", stale)');
@@ -758,16 +774,18 @@ describe("monitor", () => {
     expect(html).toContain("entries.push({ lease: lease, machine: local, homeDir: state.home_dir })");
     expect(html).toContain("function completionIcon(className)");
     expect(html).toContain('event.agent_state === "done"\n          ? completionIcon()');
-    expect(html).toContain('if (event.agent_state === "done") return "claims released"');
+    expect(html).toContain('if (event.agent_state === "done") return "finished"');
     expect(html).toContain('? "completed work"');
-    // A stop is its own ending: amber octagon, the agent's reason quoted, and
-    // blocked calls name who was in the way.
+    // A stop is its own ending: amber octagon and the agent's reason quoted.
     expect(html).toContain("function stopIcon(className)");
-    expect(html).toContain('if (event.agent_state === "stopped") return "stopped unfinished, claims released"');
+    expect(html).toContain('if (event.agent_state === "stopped") return "stopped unfinished"');
     expect(html).toContain('? "stopped work"');
-    expect(html).toContain("function waitingText(blockers)");
-    expect(html).toContain('el("div", "waiting-note")');
     expect(html).toContain('task.outcome === "stopped"');
+    // Overlapping paths in one checkout show on the card, named by agent.
+    expect(html).toContain("function overlapsFor(entry, entries)");
+    expect(html).toContain('var text = "overlaps with " + names.slice(0, 2).join(", ")');
+    expect(html).toContain('el("div", "overlap-note")');
+    expect(html).toContain('editingSection.appendChild(el("p", "detail-label", "Editing"))');
     // A stop names who it waits on, so a question for the user stands apart.
     expect(html).toContain("function stopLabel(waitingOn, resumed)");
     expect(html).toContain('if (waitingOn === "user") return "waiting on you"');
@@ -776,21 +794,8 @@ describe("monitor", () => {
     expect(html).toContain('if (resumed) return "resumed"');
     expect(html).toContain("task.resumed = live.has(session) || lastHeard.get(session) > task.ended_at_ms");
     expect(html).toContain("var resumed = heardLater.has(session)");
-    // A testing or planning agent is live but holds nothing, so its card must
-    // say so instead of reading like an ordinary set of claims.
-    expect(html).toContain('var testing = lease.agent_state === "testing"');
-    expect(html).toContain('var planning = lease.agent_state === "planning"');
-    expect(html).toContain('meta.appendChild(el("span", "agent-state", lease.agent_state))');
-    expect(html).toContain('el("span", null, "not blocking")');
-    expect(html).toContain('planning ? "Areas being read" : testing ? "Scopes under test" : "Claimed scopes"');
-    expect(html).toContain('if (event.agent_state === "testing") return "verifying, claims released"');
-    expect(html).toContain('if (event.agent_state === "planning") return "planning, nothing claimed"');
-    expect(html).toContain('? "started testing"');
-    expect(html).toContain('? "started planning"');
-    // A session that only ever planned and then went quiet changed nothing,
-    // so it must not be rolled up as recent work.
-    expect(html).toContain('if (event.agent_state !== "planning") task.edited = true');
-    expect(html).toContain('return task.edited || task.outcome !== "expired"');
+    // Nothing on the page speaks of claims or blocking any more.
+    expect(html).not.toMatch(/exclusive|blocked|claimed|waiting-note/);
     expect(html).toContain(
       'id="project-filter-select" aria-label="Filter agents by project or machine"',
     );
@@ -816,7 +821,7 @@ describe("monitor", () => {
     expect(html).toContain("function groupTasksByRepo(tasks)");
     expect(html).toContain('el("summary", "recent-label", "Recent")');
     expect(html).toContain("list.length < MAX_PROJECT_RECENT_TASKS");
-    expect(html).toContain("if (task.ended_at_ms < cutoff) return false");
+    expect(html).toContain("return task.ended_at_ms >= cutoff");
     // Finished work stays collapsed under live agents so it can never push
     // another project's running work below the fold, and a section with
     // nothing but recent tasks still opens.
@@ -938,10 +943,7 @@ describe("monitor", () => {
     expect(peer?.snapshot?.database_available).toBeTrue();
     expect(peer?.snapshot?.agent_count).toBe(1);
     expect(peer?.snapshot?.leases[0]?.agent_id).toBe("alpha");
-    expect(peer?.snapshot?.leases[0]?.claims).toEqual([
-      { path: "src/auth/token.ts", access: "exclusive" },
-      { path: "tests/auth", access: "shared" },
-    ]);
+    expect(peer?.snapshot?.leases[0]?.paths).toEqual(["src/auth/token.ts", "tests/auth"]);
     expect(peer?.snapshot?.leases[0]?.expires_at_ms).toBeGreaterThan(Date.now());
     expect(peer?.snapshot?.events).toHaveLength(3);
     expect(typeof peer?.snapshot?.home_dir).toBe("string");
@@ -1013,24 +1015,58 @@ describe("monitor", () => {
     expect(state.peers[0]?.snapshot?.agent_count).toBe(1);
   });
 
-  test("carries a testing agent on another machine through federation", async () => {
-    const peerDbPath = temporaryDatabasePath();
-    seedDatabase(peerDbPath, Date.now());
-    const peerDatabase = new Database(peerDbPath, { strict: true });
-    peerDatabase.exec("ALTER TABLE leases ADD COLUMN testing INTEGER NOT NULL DEFAULT 0");
-    peerDatabase.exec("UPDATE leases SET testing = 1 WHERE agent_id = 'alpha'");
-    peerDatabase.exec("UPDATE claims SET access = 'shared' WHERE lease_id = 'lease-active'");
-    peerDatabase.close(false);
-    const peerMonitor = startTestMonitor(peerDbPath);
+  test("reads a peer monitor that predates awareness-only leases", async () => {
+    // A machine still running an older monitor sends claims objects, a
+    // resolved "testing" state, and claim-era event fields.
+    const nowMs = Date.now();
+    const legacyUrl = startFakePeer(() =>
+      Response.json({
+        now_ms: nowMs,
+        hostname: "older-mac",
+        home_dir: "/home/peer",
+        database_available: true,
+        schema_version: 2,
+        agent_count: 1,
+        leases: [
+          {
+            agent_id: "Claude OLD1",
+            agent_label: "Claude",
+            agent_state: "testing",
+            summary: "Verify the parser",
+            repo_name: "repo",
+            worktree_root: "/peer/repo",
+            expires_at_ms: nowMs + 60_000,
+            claims: [
+              { path: "src/parser.ts", access: "exclusive" },
+              { path: "tests", access: "shared" },
+            ],
+          },
+        ],
+        event_count: 1,
+        events: [
+          {
+            created_at_ms: nowMs,
+            event_type: "announced",
+            status: "blocked",
+            agent_state: "planning",
+            summary: "Plan the parser",
+            requested_scope_count: 2,
+            granted_scope_count: 0,
+            blocked_scope_count: 2,
+            blockers: [{ agent_id: "Codex X", path: "src" }],
+          },
+        ],
+      }),
+    );
+    const monitor = startTestMonitor(temporaryDatabasePath(), { peers: [legacyUrl] });
+    const snapshot = (await fetchState(monitor)).peers[0]?.snapshot;
 
-    const localMonitor = startTestMonitor(temporaryDatabasePath(), {
-      peers: [peerMonitor.url.replace(/\/$/, "")],
+    expect(snapshot?.leases[0]).toMatchObject({
+      agent_state: "working",
+      paths: ["src/parser.ts", "tests"],
     });
-    const state = await fetchState(localMonitor);
-
-    // The peer resolves the flag before sending, so the receiving side only has
-    // to accept "testing" as a state it already knows.
-    expect(state.peers[0]?.snapshot?.leases[0]?.agent_state).toBe("testing");
+    expect(snapshot?.events[0]).toMatchObject({ agent_state: "working", path_count: 2 });
+    expect(snapshot?.events[0]).not.toHaveProperty("blockers");
   });
 
   test("degrades an unreachable peer to a marked entry without breaking local state", async () => {
@@ -1101,10 +1137,7 @@ describe("monitor", () => {
       created_at_ms: nowMs,
       updated_at_ms: nowMs,
       expires_at_ms: nowMs + 60_000,
-      claims: [
-        { path: "ok", access: "root" },
-        { path: "", access: "exclusive" },
-      ],
+      paths: ["ok", "", 7, "x\u202ey", "p".repeat(2_000), ...Array.from({ length: 100 }, (_, i) => "extra-" + i)],
       ...overrides,
     });
     const hostileUrl = startFakePeer(() =>
@@ -1165,19 +1198,20 @@ describe("monitor", () => {
     expect(lease?.client_surface).toBe("unknown");
     expect(lease?.dirty).toBeNull();
     expect(lease?.dirty_paths.length).toBe(40);
-    expect(lease?.claims).toEqual([{ path: "ok", access: "shared" }]);
+    // Paths are peer-authored: non-strings and empties dropped, text bounded
+    // and stripped of formatting, and the list capped.
+    expect(lease?.paths.slice(0, 3)).toEqual(["ok", "x y", "p".repeat(512)]);
+    expect(lease?.paths.length).toBe(62);
     // A far-future expiry is clamped instead of pinning the card for a year.
     const clampedLease = snapshot?.leases.find((entry) => entry.agent_id === "agent-1000");
     expect(clampedLease?.expires_at_ms).toBeLessThanOrEqual(Date.now() + 3 * 60 * 60 * 1_000);
-    expect(snapshot?.events[0]?.status).toBe("granted");
     expect(snapshot?.events[0]?.emoji).toBeNull();
-    // Blockers and the stop reason are peer-authored too: bounded, truncated,
-    // and empty entries dropped.
+    // The stop reason is peer-authored too: bounded and truncated.
     expect(snapshot?.events[0]?.reason?.length).toBe(200);
     // An unknown waiting_on is dropped rather than rendered.
     expect(snapshot?.events[0]?.waiting_on).toBeNull();
-    expect(snapshot?.events[0]?.blockers.length).toBe(8);
-    expect(snapshot?.events[0]?.blockers[0]?.path.length).toBe(512);
+    // Claim-era fields from a peer never reach the page.
+    expect(snapshot?.events[0]).not.toHaveProperty("blockers");
     expect(snapshot?.event_count).toBe(10_000);
     expect(snapshot?.events_truncated).toBe(9_999);
     expect(JSON.stringify(state)).not.toContain("should-not-nest");

@@ -367,9 +367,8 @@ h1 {
   font-size: 12px;
 }
 
-/* Two agents in one checkout edit the same files. That is ordinary and
-   often deliberate, so it reads as plain emphasis — the alarm colours stay
-   reserved for a scope somebody is actually blocked on. */
+/* Several agents in one checkout is ordinary and often deliberate, so it
+   reads as plain emphasis rather than an alarm colour. */
 .worktree-shared {
   color: var(--fg);
   font-size: 12px;
@@ -379,7 +378,7 @@ h1 {
 
 /* Sessions from the same agent, app, machine, and worktree share one identity
    line. The sessions stay separate below it, retaining independent state,
-   timestamps, scopes, and blockers without repeating the visual byline. */
+   timestamps, and paths without repeating the visual byline. */
 .agent-cluster {
   min-width: 0;
 }
@@ -514,7 +513,7 @@ h1 {
 }
 
 /* The countdown reads as a chip like the rest of the byline; its title
-   carries the wall-clock deadline and the timebox behind it. */
+   carries the wall-clock deadline and the lease window behind it. */
 .expiry-chip {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
@@ -558,48 +557,25 @@ h1 {
   overflow-wrap: anywhere;
 }
 
-/* Red is reserved for a scope another agent is actually blocked on.
-   Uncommitted work and exclusive claims are the normal shape of a busy
-   worktree, so they read as emphasis, not as an alarm. */
+/* Uncommitted work is the normal shape of a busy worktree, so it reads as
+   emphasis, not as an alarm. */
 .dirty[data-state="dirty"] {
   color: var(--fg);
 }
 
-/* A lease outlives the agent that took it: a crashed session keeps its
-   claims until expiry. A check-in gap past half the declared timebox is
-   the cheapest doubt signal there is — amber, because it is a doubt and
-   not a conflict. */
+/* A lease outlives the agent that took it: a crashed session stays on the
+   board until expiry. A check-in gap past half the lease window is the
+   cheapest doubt signal there is, so it reads amber. */
 .meta .stale {
   color: var(--warning);
 }
 
-/* Testing and planning are normal phases of a healthy session, so they read
-   as plain emphasis against the muted meta line rather than as a colour
-   alert. */
-.agent-state {
-  color: var(--fg);
-  font-weight: 500;
-}
-
-.status[data-status="partial"] {
-  color: var(--warning);
-}
-
-.status[data-status="blocked"] {
-  color: var(--alert);
-}
-
-/* A live agent whose last call came back blocked: red because a scope is
-   actually blocked (the one thing red is reserved for), amber when only
-   part of the request was. */
-.waiting-note {
+/* Another live agent in this checkout announced overlapping paths. Amber,
+   like a stale check-in: worth a look, never a conflict on its own. */
+.overlap-note {
   margin-top: 6px;
   font-size: 12px;
   font-weight: 500;
-  color: var(--alert);
-}
-
-.waiting-note[data-status="partial"] {
   color: var(--warning);
 }
 
@@ -812,72 +788,23 @@ h1 {
   font-weight: 500;
 }
 
-.activity-status[data-status="granted"] {
+.activity-status[data-status="working"] {
   color: var(--live);
 }
 
-/* Released claims are the expected ending, not news: they read at the
-   same weight as the rest of the context line. */
+/* Finishing is the expected ending, not news: it reads at the same weight
+   as the rest of the context line. */
 .activity-status[data-status="completed"] {
   color: var(--fg-muted);
-}
-
-.activity-status[data-status="partial"] {
-  color: var(--warning);
-}
-
-.activity-status[data-status="blocked"] {
-  color: var(--alert);
 }
 
 .activity-status[data-status="stopped"] {
   color: var(--warning);
 }
 
-/* A planner holds nothing and can conflict with nobody, so its calls are the
-   quietest thing in the feed. */
-.activity-status[data-status="planning"] {
-  color: var(--fg-muted);
-}
-
 /* The stopping agent's own words, quoted next to the amber status. */
 .activity-reason {
   color: var(--fg);
-}
-
-.badges {
-  margin-top: 12px;
-  border-top: 1px solid var(--border);
-}
-
-.badge {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: baseline;
-  gap: 16px;
-  min-width: 0;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border);
-  color: var(--fg-muted);
-}
-
-.badge .mono {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.badge .access {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.92em;
-  color: var(--fg-faint);
-}
-
-.badge[data-access="exclusive"] {
-  color: var(--fg);
-}
-
-.badge[data-access="exclusive"] .access {
-  color: var(--warning);
 }
 
 details {
@@ -895,10 +822,6 @@ details {
   font-size: 12px;
 }
 
-.agent-details .exclusive-count {
-  color: var(--warning);
-}
-
 .detail-section {
   margin-top: 10px;
 }
@@ -911,7 +834,6 @@ details {
   text-transform: uppercase;
 }
 
-.detail-section .badges,
 .detail-section .paths {
   margin-top: 0;
 }
@@ -1055,7 +977,7 @@ footer[data-peers]::after {
   }
 
   /* A clustered card no longer repeats the full identity, so its compact
-     session id remains visible on phones to associate state and claims with
+     session id remains visible on phones to associate state and paths with
      the right live process. */
   .agent-cluster-card .session-chip {
     display: inline-flex;
@@ -1124,11 +1046,6 @@ footer[data-peers]::after {
   .task-group-where {
     flex-basis: 100%;
     margin-left: 0;
-  }
-
-  .badge {
-    grid-template-columns: 1fr;
-    gap: 2px;
   }
 
   footer::after {

@@ -8,9 +8,7 @@ import { normalizeClientSurface, type ClientSurface } from "./client-surface";
 import { sanitizeEmoji } from "./emoji";
 import { defaultDatabasePath } from "./store";
 import {
-  agentStateFromLease,
   agentStateFromRow,
-  normalizeAgentState,
   normalizeWaitingOn,
   type AgentState,
   type WaitingOn,
@@ -29,7 +27,7 @@ const HOSTNAME = "127.0.0.1";
 // Optional peer aggregation: this monitor can merge read-only snapshots from
 // other machines' monitors (typically their Tailscale Serve URLs) into its own
 // state payload. Peers are outbound reads only — the local listener stays
-// loopback-bound, and peer data never reaches announce arbitration.
+// loopback-bound, and peer data never reaches announce responses.
 const MAX_PEERS = 8;
 const DEFAULT_PEER_TIMEOUT_MS = 1_500;
 // Marks a request as coming from another monitor, so the response is built from
@@ -42,26 +40,17 @@ const DEFAULT_PEER_TIMEOUT_MS = 1_500;
 const PEER_REQUEST_PARAM = "peer";
 const MAX_PEER_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PEER_LEASES = 200;
-const MAX_PEER_CLAIMS = 64;
+const MAX_PEER_PATHS = 64;
 // Matches MAX_DIRTY_PATHS in store.ts: an honest peer never sends more.
 const MAX_PEER_DIRTY_PATHS = 40;
-// Matches MAX_EVENT_BLOCKERS in store.ts for the same reason.
-const MAX_PEER_EVENT_BLOCKERS = 8;
-// Local leases can never expire more than the 2h timebox bucket ahead; allow
-// peer clocks an extra hour of slack before clamping their expiries.
+// Leases from this version expire 30 minutes ahead and older versions' at most
+// two hours ahead; allow peer clocks an extra hour of slack before clamping.
 const MAX_PEER_EXPIRY_AHEAD_MS = 3 * 60 * 60 * 1_000;
 
-// Same control/directional-formatting defense as coordinate.ts and scopes.ts:
+// Same control/directional-formatting defense as coordinate.ts and paths.ts:
 // peer monitor payloads carry peer-authored text that never went through this
 // machine's announce validation.
 const UNSAFE_FORMATTING = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
-
-export type MonitorAccess = "shared" | "exclusive";
-
-export interface MonitorClaim {
-  path: string;
-  access: MonitorAccess;
-}
 
 export interface MonitorLease {
   agent_id: string;
@@ -83,22 +72,15 @@ export interface MonitorLease {
   created_at_ms: number | null;
   updated_at_ms: number | null;
   expires_at_ms: number;
-  claims: MonitorClaim[];
+  // What the agent said it is editing.
+  paths: string[];
 }
 
 export type MonitorEventType = "announced" | "renewed";
-export type MonitorEventStatus = "granted" | "partial" | "blocked";
-
-/** Who a blocked or partial call was waiting on, and on which claimed path. */
-export interface MonitorEventBlocker {
-  agent_id: string;
-  path: string;
-}
 
 export interface MonitorEvent {
   event_id: number;
   event_type: MonitorEventType;
-  status: MonitorEventStatus;
   agent_id: string;
   agent_label: string;
   client_surface: ClientSurface;
@@ -114,10 +96,7 @@ export interface MonitorEvent {
   repo_name: string;
   worktree_root: string;
   branch: string | null;
-  requested_scope_count: number;
-  granted_scope_count: number;
-  blocked_scope_count: number;
-  blockers: MonitorEventBlocker[];
+  path_count: number;
   peer_count: number;
   created_at_ms: number;
 }
@@ -316,8 +295,8 @@ export function readState(dbPath: string, nowMs: number): MonitorState {
       const rows = database
         .query("SELECT * FROM leases WHERE expires_at_ms > ? ORDER BY updated_at_ms DESC")
         .all(nowMs) as Array<Record<string, unknown>>;
-      const claims = readClaims(database, rows);
-      const leases = rows.map((row) => toLease(row, claims));
+      const paths = readPaths(database, rows);
+      const leases = rows.map((row) => toLease(row, paths));
       const activity = readEvents(database, nowMs);
       const state = {
         ...empty,
@@ -522,9 +501,13 @@ function sanitizePeerLease(value: unknown, skewMs: number, nowMs: number): Monit
   // a stale or hostile peer cannot pin permanently-expired rows in the UI.
   if (expiresAtMs === null || expiresAtMs <= nowMs) return null;
 
-  const claims = boundedArray(row.claims, MAX_PEER_CLAIMS)
-    .map(sanitizePeerClaim)
-    .filter((claim): claim is MonitorClaim => claim !== null);
+  // Monitors that predate awareness-only leases send claims objects rather
+  // than plain paths; read either, so a mixed pair of machines keeps working.
+  const paths = (Array.isArray(row.paths)
+    ? boundedArray(row.paths, MAX_PEER_PATHS)
+    : boundedArray(row.claims, MAX_PEER_PATHS).map(claimPath))
+    .map((path) => boundedPeerText(path, 512).trim())
+    .filter((path) => path.length > 0);
   const dirtyPaths = boundedArray(row.dirty_paths, MAX_PEER_DIRTY_PATHS)
     .filter((path): path is string => typeof path === "string")
     .map((path) => boundedPeerText(path, 512));
@@ -534,7 +517,7 @@ function sanitizePeerLease(value: unknown, skewMs: number, nowMs: number): Monit
     agent_id: boundedPeerText(row.agent_id, 120),
     agent_label: boundedPeerText(row.agent_label, 80),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: normalizeAgentState(row.agent_state),
+    agent_state: toAgentState(row.agent_state),
     summary: boundedPeerText(row.summary, 200),
     // Stricter than bounding: a peer's emoji is only rendered when it really is
     // a single emoji, so a remote monitor cannot inject a text banner here.
@@ -552,16 +535,22 @@ function sanitizePeerLease(value: unknown, skewMs: number, nowMs: number): Monit
     created_at_ms: rebasedTimestamp(row.created_at_ms, skewMs, nowMs),
     updated_at_ms: rebasedTimestamp(row.updated_at_ms, skewMs, nowMs),
     expires_at_ms: expiresAtMs,
-    claims,
+    paths,
   };
 }
 
-function sanitizePeerClaim(value: unknown): MonitorClaim | null {
+function claimPath(value: unknown): unknown {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const row = value as Record<string, unknown>;
-  const path = boundedPeerText(row.path, 512).trim();
-  if (path.length === 0) return null;
-  return { path, access: toAccess(row.access) };
+  return (value as Record<string, unknown>).path;
+}
+
+/**
+ * A peer payload carries the resolved state as a string. Older monitors may
+ * still send the retired "planning" and "testing", which both meant a live
+ * agent.
+ */
+function toAgentState(value: unknown): AgentState {
+  return value === "done" || value === "stopped" ? value : "working";
 }
 
 function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): MonitorEvent | null {
@@ -573,11 +562,10 @@ function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): Monit
   return {
     event_id: boundedPeerCount(row.event_id),
     event_type: row.event_type === "renewed" ? "renewed" : "announced",
-    status: toEventStatus(row.status),
     agent_id: boundedPeerText(row.agent_id, 120),
     agent_label: boundedPeerText(row.agent_label, 80),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: normalizeAgentState(row.agent_state),
+    agent_state: toAgentState(row.agent_state),
     summary: boundedPeerText(row.summary, 200),
     reason: boundedPeerNullableText(row.reason, 200),
     waiting_on: row.agent_state === "stopped" ? normalizeWaitingOn(row.waiting_on) : null,
@@ -587,25 +575,11 @@ function sanitizePeerEvent(value: unknown, skewMs: number, nowMs: number): Monit
     repo_name: boundedPeerText(row.repo_name, 160),
     worktree_root: boundedPeerText(row.worktree_root, 1_024),
     branch: boundedPeerNullableText(row.branch, 200),
-    requested_scope_count: boundedPeerCount(row.requested_scope_count),
-    granted_scope_count: boundedPeerCount(row.granted_scope_count),
-    blocked_scope_count: boundedPeerCount(row.blocked_scope_count),
-    blockers: sanitizePeerBlockers(row.blockers),
+    // Older monitors send requested_scope_count instead.
+    path_count: boundedPeerCount(row.path_count ?? row.requested_scope_count),
     peer_count: boundedPeerCount(row.peer_count),
     created_at_ms: createdAtMs,
   };
-}
-
-function sanitizePeerBlockers(value: unknown): MonitorEventBlocker[] {
-  return boundedArray(value, MAX_PEER_EVENT_BLOCKERS)
-    .map((entry) => {
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-      const row = entry as Record<string, unknown>;
-      const agentId = boundedPeerText(row.agent_id, 120).trim();
-      if (agentId.length === 0) return null;
-      return { agent_id: agentId, path: boundedPeerText(row.path, 512) };
-    })
-    .filter((entry): entry is MonitorEventBlocker => entry !== null);
 }
 
 function boundedArray(value: unknown, maxItems: number): unknown[] {
@@ -646,12 +620,6 @@ function readEvents(
     const stateColumn = hasColumn(database, "activity_events", "agent_state")
       ? "agent_state"
       : "'working' AS agent_state";
-    const testingColumn = hasColumn(database, "activity_events", "testing")
-      ? "testing"
-      : "0 AS testing";
-    const planningColumn = hasColumn(database, "activity_events", "planning")
-      ? "planning"
-      : "0 AS planning";
     const stoppedColumn = hasColumn(database, "activity_events", "stopped")
       ? "stopped"
       : "0 AS stopped";
@@ -661,17 +629,13 @@ function readEvents(
     const waitingOnColumn = hasColumn(database, "activity_events", "waiting_on")
       ? "waiting_on"
       : "NULL AS waiting_on";
-    const blockersColumn = hasColumn(database, "activity_events", "blockers")
-      ? "blockers"
-      : "'[]' AS blockers";
     const emojiColumn = hasColumn(database, "activity_events", "emoji")
       ? "emoji"
       : "NULL AS emoji";
     const rows = database
       .query(
-        `SELECT event_id, event_type, status, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${testingColumn}, ${planningColumn}, ${stoppedColumn}, ${reasonColumn}, ${waitingOnColumn}, summary, ${emojiColumn},
-                repo_name, worktree_root, branch, requested_scope_count,
-                granted_scope_count, blocked_scope_count, ${blockersColumn}, peer_count, created_at_ms,
+        `SELECT event_id, event_type, agent_id, agent_label, ${surfaceColumn}, ${stateColumn}, ${stoppedColumn}, ${reasonColumn}, ${waitingOnColumn}, summary, ${emojiColumn},
+                repo_name, worktree_root, branch, requested_scope_count, peer_count, created_at_ms,
                 count(*) OVER () AS total_count
          FROM activity_events
          WHERE created_at_ms >= ?
@@ -699,15 +663,10 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
   return {
     event_id: toNullableInteger(row.event_id) ?? 0,
     event_type: row.event_type === "renewed" ? "renewed" : "announced",
-    status: toEventStatus(row.status),
     agent_id: toText(row.agent_id),
     agent_label: toText(row.agent_label),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: agentStateFromRow(row.agent_state, {
-      testing: row.testing,
-      stopped: row.stopped,
-      planning: row.planning,
-    }),
+    agent_state: agentStateFromRow(row.agent_state, row.stopped),
     summary: toText(row.summary),
     reason: toNullableText(row.reason),
     waiting_on: row.stopped ? normalizeWaitingOn(row.waiting_on) : null,
@@ -715,43 +674,11 @@ function toEvent(row: Record<string, unknown>): MonitorEvent {
     repo_name: toText(row.repo_name),
     worktree_root: toText(row.worktree_root),
     branch: toNullableText(row.branch),
-    requested_scope_count: toNullableInteger(row.requested_scope_count) ?? 0,
-    granted_scope_count: toNullableInteger(row.granted_scope_count) ?? 0,
-    blocked_scope_count: toNullableInteger(row.blocked_scope_count) ?? 0,
-    blockers: toBlockerList(row.blockers),
+    // The v2 column name predates paths; it holds the announced path count.
+    path_count: toNullableInteger(row.requested_scope_count) ?? 0,
     peer_count: toNullableInteger(row.peer_count) ?? 0,
     created_at_ms: toNullableInteger(row.created_at_ms) ?? 0,
   };
-}
-
-/**
- * `blockers` is a JSON array added after schema v2's event table first
- * shipped, so it can be missing, NULL, or unparseable in an older database.
- * Every one of those degrades to "no recorded blockers", never a hidden event.
- */
-function toBlockerList(value: unknown): MonitorEventBlocker[] {
-  if (typeof value !== "string" || value.length === 0) return [];
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .slice(0, MAX_PEER_EVENT_BLOCKERS)
-      .map((entry) => {
-        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
-        const row = entry as Record<string, unknown>;
-        const agentId = toText(row.agent_id);
-        if (agentId.length === 0) return null;
-        return { agent_id: agentId, path: toText(row.path) };
-      })
-      .filter((entry): entry is MonitorEventBlocker => entry !== null);
-  } catch {
-    return [];
-  }
-}
-
-function toEventStatus(value: unknown): MonitorEventStatus {
-  if (value === "blocked" || value === "partial") return value;
-  return "granted";
 }
 
 function readSchemaVersion(database: Database): number | null {
@@ -768,28 +695,28 @@ function hasColumn(database: Database, table: string, column: string): boolean {
   return rows.some((row) => row.name === column);
 }
 
-function readClaims(
+function readPaths(
   database: Database,
   rows: Array<Record<string, unknown>>,
-): Map<string, MonitorClaim[]> {
-  const byLease = new Map<string, MonitorClaim[]>();
+): Map<string, string[]> {
+  const byLease = new Map<string, string[]>();
   const leaseIds = rows.map((row) => toText(row.lease_id)).filter((id) => id.length > 0);
   if (leaseIds.length === 0) return byLease;
 
   try {
     const placeholders = leaseIds.map(() => "?").join(", ");
-    const claimRows = database
+    const pathRows = database
       .query(
-        `SELECT lease_id, path, access FROM claims
+        `SELECT lease_id, path FROM claims
          WHERE lease_id IN (${placeholders})
-         ORDER BY access ASC, path ASC`,
+         ORDER BY path ASC`,
       )
       .all(...leaseIds) as Array<Record<string, unknown>>;
-    for (const claimRow of claimRows) {
-      const leaseId = toText(claimRow.lease_id);
-      const claims = byLease.get(leaseId) ?? [];
-      claims.push({ path: toText(claimRow.path), access: toAccess(claimRow.access) });
-      byLease.set(leaseId, claims);
+    for (const pathRow of pathRows) {
+      const leaseId = toText(pathRow.lease_id);
+      const paths = byLease.get(leaseId) ?? [];
+      paths.push(toText(pathRow.path));
+      byLease.set(leaseId, paths);
     }
   } catch {
     // A missing or renamed claims table still leaves useful presence data.
@@ -800,22 +727,19 @@ function readClaims(
 
 function toLease(
   row: Record<string, unknown>,
-  claimsByLease: Map<string, MonitorClaim[]>,
+  pathsByLease: Map<string, string[]>,
 ): MonitorLease {
   const dirtyPaths = toPathList(row.dirty_paths);
   const dirtyCount = toNullableInteger(row.dirty_count);
-  const claims = claimsByLease.get(toText(row.lease_id)) ?? [];
   return {
     // lease_id is deliberately absent from the payload: it is the renewal
     // handle for a lease, and the MCP surface already withholds it from peers.
     agent_id: toText(row.agent_id),
     agent_label: toText(row.agent_label),
     client_surface: normalizeClientSurface(row.client_surface),
-    agent_state: agentStateFromLease(
-      row.agent_state,
-      { testing: row.testing, planning: row.planning },
-      claims,
-    ),
+    // Done and stopped leases are deleted on the spot, so every live lease is
+    // a working agent, whatever retired flags an older process wrote.
+    agent_state: "working",
     summary: toText(row.summary),
     // Older MCP processes predate the column, so the row may not carry it.
     emoji: sanitizeEmoji(row.emoji),
@@ -834,7 +758,7 @@ function toLease(
     created_at_ms: toNullableInteger(row.created_at_ms),
     updated_at_ms: toNullableInteger(row.updated_at_ms),
     expires_at_ms: toNullableInteger(row.expires_at_ms) ?? 0,
-    claims,
+    paths: pathsByLease.get(toText(row.lease_id)) ?? [],
   };
 }
 
@@ -855,12 +779,6 @@ function toNullableInteger(value: unknown): number | null {
 function toNullableBoolean(value: unknown): boolean | null {
   const asInteger = toNullableInteger(value);
   return asInteger === null ? null : asInteger !== 0;
-}
-
-function toAccess(value: unknown): MonitorAccess {
-  // Normalized rather than trusted, so a rogue value can never reach the page
-  // as a style hook or an unexpected badge variant.
-  return value === "exclusive" ? "exclusive" : "shared";
 }
 
 /**
