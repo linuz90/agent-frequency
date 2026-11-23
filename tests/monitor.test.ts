@@ -348,7 +348,7 @@ describe("monitor", () => {
       lease: { client_surface: "claude-app" },
     });
     const otherMachine = browserIdentityEntry("Claude EEEEEEEEEEEEEEEE", {
-      machine: "mba",
+      machine: "hq",
     });
 
     const groups = groupEntriesByIdentity([
@@ -378,7 +378,7 @@ describe("monitor", () => {
       alpha,
       inCheckout("Codex BBBB", ["src/billing/invoice.ts", "src/billing/pdf.ts"]),
       inCheckout("Claude CCCC", ["docs"]),
-      inCheckout("Claude DDDD", ["src/billing"], { machine: "mba" }),
+      inCheckout("Claude DDDD", ["src/billing"], { machine: "hq" }),
       browserIdentityEntry("Claude EEEE", {
         lease: { worktree_root: "/code/app-worktree", paths: ["src/billing"] },
       }),
@@ -911,9 +911,9 @@ describe("monitor", () => {
     expect(
       resolvePeers([], {
         AGENT_FREQUENCY_MONITOR_PEERS:
-          " https://mba.tailnet.ts.net/agents/ , http://127.0.0.1:7894, https://mba.tailnet.ts.net/agents",
+          " https://hq.tailnet.ts.net/agents/ , http://127.0.0.1:7894, https://hq.tailnet.ts.net/agents",
       }),
-    ).toEqual(["https://mba.tailnet.ts.net/agents", "http://127.0.0.1:7894"]);
+    ).toEqual(["https://hq.tailnet.ts.net/agents", "http://127.0.0.1:7894"]);
     // Flags take precedence over the environment, mirroring resolvePort.
     expect(
       resolvePeers(["--peer", "http://127.0.0.1:1234", "--peer=http://127.0.0.1:5678/"], {

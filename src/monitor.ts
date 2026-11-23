@@ -339,7 +339,7 @@ export async function readFederatedState(
 function localHostname(): string {
   // The machine label is display-only, and a system hostname is often both long
   // and unlike the short name its owner uses ("Fabrizios-MacBook-Pro" next to a
-  // tailnet's "mba"), so an explicit override wins. Control characters are
+  // tailnet's "hq"), so an explicit override wins. Control characters are
   // stripped because this label renders next to peer-reported names.
   const override = (process.env.AGENT_FREQUENCY_MACHINE_LABEL ?? "")
     .replace(/[\u0000-\u001f\u007f]/g, "")
@@ -354,7 +354,7 @@ function localHostname(): string {
  * Parses peer monitor URLs from repeated `--peer` flags, falling back to the
  * comma-separated AGENT_FREQUENCY_MONITOR_PEERS environment variable. URLs are
  * normalized to an origin-plus-path base (no query, fragment, or trailing
- * slash) so `https://mba.tailnet.ts.net/agents` and the bare origin both work.
+ * slash) so `https://hq.tailnet.ts.net/agents` and the bare origin both work.
  */
 export function resolvePeers(
   argv: readonly string[],
