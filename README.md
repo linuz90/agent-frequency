@@ -151,7 +151,7 @@ A monitor can aggregate other machines' monitors and render them as one view. Ea
 Expose the monitor on the machine you want to read from. Tailscale Serve keeps it inside your tailnet:
 
 ```bash
-# on the machine being read, e.g. mba
+# on the machine being read, e.g. hq
 tailscale serve --bg --set-path=/agents 7893
 ```
 
@@ -159,10 +159,10 @@ Then point another machine's monitor at it:
 
 ```bash
 # a monitor you start yourself
-./bin/agent-frequency-monitor --peer https://mba.your-tailnet.ts.net/agents
+./bin/agent-frequency-monitor --peer https://hq.your-tailnet.ts.net/agents
 
 # or bake it into the login service
-./bin/agent-frequency-install --with-mac-service --peer https://mba.your-tailnet.ts.net/agents
+./bin/agent-frequency-install --with-mac-service --peer https://hq.your-tailnet.ts.net/agents
 ```
 
 `AGENT_FREQUENCY_MONITOR_PEERS` accepts the same URLs as a comma-separated list. Repeat `--peer` for more than one, up to eight.
